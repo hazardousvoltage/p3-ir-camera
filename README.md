@@ -4,7 +4,9 @@ Python driver and viewer for P3-series USB thermal cameras.
 
 ![P3 Viewer](screenshots/viewer.png)
 
-**Device**: VID=0x3474, PID=0x45A2, 256x192 native resolution
+**Devices**:
+- P1: VID=0x3474, PID=0x45C2, 160×120 native resolution
+- P3: VID=0x3474, PID=0x45A2, 256×192 native resolution
 
 > **Disclaimer**: This is an independent open-source project. It is not
 > affiliated with, endorsed by, or connected to any camera manufacturer.
@@ -35,6 +37,9 @@ Create a udev rule to allow non-root access:
 
 ```bash
 sudo tee /etc/udev/rules.d/99-p3-ir.rules << EOF
+# P1 camera
+SUBSYSTEM=="usb", ATTR{idVendor}=="3474", ATTR{idProduct}=="45c2", MODE="0666"
+# P3 camera
 SUBSYSTEM=="usb", ATTR{idVendor}=="3474", ATTR{idProduct}=="45a2", MODE="0666"
 EOF
 sudo udevadm control --reload-rules
@@ -47,7 +52,7 @@ pyusb requires a libusb-compatible driver. Use [Zadig](https://zadig.akeo.ie/):
 
 1. Download and run Zadig
 2. Options → List All Devices
-3. Select the P3 camera (VID 3474, PID 45A2)
+3. Select the camera (VID 3474, PID 45C2 for P1 or 45A2 for P3)
 4. Select **WinUSB** driver
 5. Click "Replace Driver"
 
@@ -56,7 +61,14 @@ pyusb requires a libusb-compatible driver. Use [Zadig](https://zadig.akeo.ie/):
 ### Viewer
 
 ```bash
+# Use P3 camera (default, 256×192)
 p3-viewer
+
+# Use P1 camera (160×120)
+p3-viewer --model=p1
+
+# Use P3 camera explicitly
+p3-viewer --model=p3
 ```
 
 **Controls:**
@@ -81,9 +93,13 @@ p3-viewer
 ### Library
 
 ```python
-from p3_camera import P3Camera, raw_to_celsius
+from p3_camera import Model, P3Camera, get_model_config, raw_to_celsius
 
+# Use P3 camera (default)
 camera = P3Camera()
+# Or use P1 camera
+# camera = P3Camera(config=get_model_config(Model.P1))
+
 camera.connect()
 camera.init()
 camera.start_streaming()
@@ -91,7 +107,9 @@ camera.start_streaming()
 ir_brightness, thermal_raw = camera.read_frame_both()
 temps_celsius = raw_to_celsius(thermal_raw)
 
-print(f"Center temp: {temps_celsius[95, 128]:.1f}C")
+# Center coordinates depend on model
+# P1: (59, 80), P3: (95, 128)
+print(f"Center temp: {temps_celsius[temps_celsius.shape[0]//2, temps_celsius.shape[1]//2]:.1f}C")
 
 camera.stop_streaming()
 camera.disconnect()

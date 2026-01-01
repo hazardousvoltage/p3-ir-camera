@@ -3,7 +3,7 @@
 USB protocol, frame parsing, temperature conversion, and calibration for
 P3-series USB thermal cameras.
 
-Device: VID=0x3474, PID=0x45A2, 256×192 native resolution.
+Device: VID=0x3474, PID=0x45C2, 160×120 native resolution.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import struct
 import time
 from dataclasses import dataclass
 from dataclasses import field
+from enum import Enum
 from enum import IntEnum
 from typing import TYPE_CHECKING
 from typing import Any
@@ -27,22 +28,78 @@ _ArrT = TypeVar("_ArrT", bound="NDArray[Any]")
 
 # Device constants
 VID = 0x3474
-PID = 0x45A2
-FRAME_W = 256
-FRAME_H = 384  # (192 IR + 2 info + 190 temp) = 384 rows
 HEADER_SIZE = 12
-# Frame layout:
-# - Rows 0-191: IR brightness data (hardware AGC'd, for display)
-# - Rows 192-193: Info/metadata
-# - Rows 194-383: Temperature data (raw Kelvin × 64)
-IR_ROW_START = 0
-IR_ROW_END = 192
-THERMAL_ROW_START = 194
-THERMAL_ROW_END = 384
-THERMAL_ROWS = THERMAL_ROW_END - THERMAL_ROW_START  # 190 rows
 # Temperature conversion constants
 TEMP_SCALE = 64  # Raw values are in 1/64 Kelvin units
 KELVIN_OFFSET = 273.15
+
+
+class Model(str, Enum):
+    """Camera model."""
+
+    P1 = "p1"  # 160×120 resolution, PID=0x45C2
+    P3 = "p3"  # 256×192 resolution, PID=0x45A2
+
+
+@dataclass(frozen=True, slots=True)
+class ModelConfig:
+    """Model-specific configuration."""
+
+    model: Model
+    pid: int
+    frame_w: int
+    frame_h: int
+    ir_row_end: int
+    thermal_row_start: int
+    thermal_row_end: int
+
+    @property
+    def thermal_rows(self) -> int:
+        """Number of thermal rows."""
+        return self.thermal_row_end - self.thermal_row_start
+
+
+def get_model_config(model: Model | str = Model.P3) -> ModelConfig:
+    """Get configuration for a camera model.
+
+    Args:
+        model: Camera model (P1 or P3).
+
+    Returns:
+        Model configuration.
+    """
+    model = Model(model.lower())
+    if model == Model.P1:
+        return ModelConfig(
+            model=Model.P1,
+            pid=0x45C2,
+            frame_w=160,
+            frame_h=240,  # (120 IR + 2 info + 118 temp) = 240 rows
+            ir_row_end=120,
+            thermal_row_start=122,
+            thermal_row_end=240,
+        )
+    else:  # P3
+        return ModelConfig(
+            model=Model.P3,
+            pid=0x45A2,
+            frame_w=256,
+            frame_h=384,  # (192 IR + 2 info + 190 temp) = 384 rows
+            ir_row_end=192,
+            thermal_row_start=194,
+            thermal_row_end=384,
+        )
+
+
+# Default model config (P3 for backward compatibility)
+_DEFAULT_CONFIG = get_model_config(Model.P3)
+FRAME_W = _DEFAULT_CONFIG.frame_w
+FRAME_H = _DEFAULT_CONFIG.frame_h
+IR_ROW_START = 0
+IR_ROW_END = _DEFAULT_CONFIG.ir_row_end
+THERMAL_ROW_START = _DEFAULT_CONFIG.thermal_row_start
+THERMAL_ROW_END = _DEFAULT_CONFIG.thermal_row_end
+THERMAL_ROWS = _DEFAULT_CONFIG.thermal_rows
 
 
 class GainMode(IntEnum):
@@ -160,7 +217,7 @@ def celsius_to_raw(celsius: float) -> int:
 
 
 def _fix_alignment_quirk(img: _ArrT) -> _ArrT:
-    """Fix column alignment quirk in P3 camera data.
+    """Fix column alignment quirk in P-series camera data.
 
     The P3 camera has a hardware quirk where the first 12 columns of each row
     are transmitted at the end of the previous row's USB data. This appears to
@@ -168,15 +225,16 @@ def _fix_alignment_quirk(img: _ArrT) -> _ArrT:
     wraps to columns 0-11, but USB transfer packs data linearly.
 
     This causes:
-    1. Columns 0-11 to appear shifted up by one row relative to columns 12-255
+    1. Columns 0-11 to appear shifted up by one row relative to columns 12-159 (P1) or 12-255 (P3)
     2. The last row of columns 0-11 to contain garbage (no source data)
 
     Fix:
-    1. Roll image left by 12 columns (moves cols 0-11 to cols 244-255)
+    1. Roll image left by 12 columns (moves cols 0-11 to cols 148-159 for P1 or 244-255 for P3)
     2. Roll those 12 columns up by 1 row to realign with the rest
     3. Copy second-to-last row over last row to hide garbage
 
     The 12-column (24-byte) offset suggests DMA/USB buffer alignment boundary.
+    Note: This quirk may be specific to P3; P1 may not require this fix.
     """
     col_offset = -12
     row_shift = -1
@@ -191,29 +249,33 @@ def _fix_alignment_quirk(img: _ArrT) -> _ArrT:
 def extract_thermal_data(
     frame_data: bytes,
     apply_col_offset: bool = True,
+    config: ModelConfig | None = None,
 ) -> NDArray[np.uint16] | None:
     """Extract temperature image from raw frame data.
 
     Args:
         frame_data: Raw USB frame data.
         apply_col_offset: Whether to apply column alignment fix.
+        config: Model configuration (defaults to P3).
 
     Returns:
-        Temperature image as uint16 array (190×256), or None if invalid.
+        Temperature image as uint16 array, or None if invalid.
 
     """
-    expected_size = HEADER_SIZE + FRAME_W * FRAME_H * 2
+    if config is None:
+        config = _DEFAULT_CONFIG
+    expected_size = HEADER_SIZE + config.frame_w * config.frame_h * 2
     if len(frame_data) < expected_size:
         return None
 
     pixels = np.frombuffer(
-        frame_data[HEADER_SIZE : HEADER_SIZE + FRAME_W * FRAME_H * 2],
+        frame_data[HEADER_SIZE : HEADER_SIZE + config.frame_w * config.frame_h * 2],
         dtype="<u2",
     )
-    full_frame = pixels.reshape((FRAME_H, FRAME_W))
+    full_frame = pixels.reshape((config.frame_h, config.frame_w))
 
     # Extract thermal region
-    thermal = full_frame[THERMAL_ROW_START:THERMAL_ROW_END, :].copy()
+    thermal = full_frame[config.thermal_row_start : config.thermal_row_end, :].copy()
 
     if apply_col_offset:
         thermal = _fix_alignment_quirk(thermal)
@@ -224,32 +286,36 @@ def extract_thermal_data(
 def extract_ir_brightness(
     frame_data: bytes,
     apply_col_offset: bool = True,
+    config: ModelConfig | None = None,
 ) -> NDArray[np.uint8] | None:
     """Extract IR brightness image from raw frame data.
 
-    Rows 0-191 contain display data, taking the low byte of each 16-bit
+    Rows 0-(ir_row_end-1) contain display data, taking the low byte of each 16-bit
     value. This data is hardware AGC'd by the camera.
 
     Args:
         frame_data: Raw USB frame data.
         apply_col_offset: Whether to apply column alignment fix.
+        config: Model configuration (defaults to P3).
 
     Returns:
-        IR brightness image as uint8 array (192×256), or None if invalid.
+        IR brightness image as uint8 array, or None if invalid.
 
     """
-    expected_size = HEADER_SIZE + FRAME_W * FRAME_H * 2
+    if config is None:
+        config = _DEFAULT_CONFIG
+    expected_size = HEADER_SIZE + config.frame_w * config.frame_h * 2
     if len(frame_data) < expected_size:
         return None
 
     pixels = np.frombuffer(
-        frame_data[HEADER_SIZE : HEADER_SIZE + FRAME_W * FRAME_H * 2],
+        frame_data[HEADER_SIZE : HEADER_SIZE + config.frame_w * config.frame_h * 2],
         dtype="<u2",
     )
-    full_frame = pixels.reshape((FRAME_H, FRAME_W))
+    full_frame = pixels.reshape((config.frame_h, config.frame_w))
 
-    # Extract IR brightness region (rows 0-191)
-    ir_16bit = full_frame[IR_ROW_START:IR_ROW_END, :].copy()
+    # Extract IR brightness region
+    ir_16bit = full_frame[IR_ROW_START : config.ir_row_end, :].copy()
 
     # Low byte contains 8-bit brightness
     ir_8bit = (ir_16bit & 0xFF).astype(np.uint8)
@@ -263,33 +329,37 @@ def extract_ir_brightness(
 def extract_both(
     frame_data: bytes,
     apply_col_offset: bool = True,
+    config: ModelConfig | None = None,
 ) -> tuple[NDArray[np.uint8] | None, NDArray[np.uint16] | None]:
     """Extract both IR brightness and temperature data from frame.
 
     Args:
         frame_data: Raw USB frame data.
         apply_col_offset: Whether to apply column alignment fix.
+        config: Model configuration (defaults to P3).
 
     Returns:
         Tuple of (ir_brightness, temperature), either can be None on error.
 
     """
-    expected_size = HEADER_SIZE + FRAME_W * FRAME_H * 2
+    if config is None:
+        config = _DEFAULT_CONFIG
+    expected_size = HEADER_SIZE + config.frame_w * config.frame_h * 2
     if len(frame_data) < expected_size:
         return None, None
 
     pixels = np.frombuffer(
-        frame_data[HEADER_SIZE : HEADER_SIZE + FRAME_W * FRAME_H * 2],
+        frame_data[HEADER_SIZE : HEADER_SIZE + config.frame_w * config.frame_h * 2],
         dtype="<u2",
     )
-    full_frame = pixels.reshape((FRAME_H, FRAME_W))
+    full_frame = pixels.reshape((config.frame_h, config.frame_w))
 
-    # IR brightness (rows 0-191, low byte)
-    ir_16bit = full_frame[IR_ROW_START:IR_ROW_END, :].copy()
+    # IR brightness (low byte)
+    ir_16bit = full_frame[IR_ROW_START : config.ir_row_end, :].copy()
     ir_8bit = (ir_16bit & 0xFF).astype(np.uint8)
 
-    # Temperature (rows 194-383)
-    thermal = full_frame[THERMAL_ROW_START:THERMAL_ROW_END, :].copy()
+    # Temperature
+    thermal = full_frame[config.thermal_row_start : config.thermal_row_end, :].copy()
 
     if apply_col_offset:
         ir_8bit = _fix_alignment_quirk(ir_8bit)
@@ -381,15 +451,17 @@ class P3Camera:
     streaming: bool = False
     gain_mode: GainMode = GainMode.HIGH
     env_params: EnvParams = field(default_factory=EnvParams)
+    config: ModelConfig = field(default_factory=lambda: _DEFAULT_CONFIG)
 
     def connect(self) -> None:
-        """Connect to the P3 camera."""
-        import usb.core
-        import usb.util
+        """Connect to the camera."""
+        import usb.core  # type: ignore[import-untyped]
+        import usb.util  # type: ignore[import-untyped]
 
-        self.dev = usb.core.find(idVendor=VID, idProduct=PID)
+        self.dev = usb.core.find(idVendor=VID, idProduct=self.config.pid)
         if self.dev is None:
-            raise RuntimeError("P3 camera not found")
+            model_name = self.config.model.value.upper()
+            raise RuntimeError(f"{model_name} camera not found (PID=0x{self.config.pid:04X})")
         self._detach_kernel_drivers()
         self._claim_interfaces()
 
@@ -446,7 +518,7 @@ class P3Camera:
         """Read both IR brightness and temperature data.
 
         Returns:
-            Tuple of (ir_brightness 192×256 uint8, temperature 190×256 uint16).
+            Tuple of (ir_brightness uint8, temperature uint16).
             Either can be None on error.
 
         """
@@ -454,7 +526,7 @@ class P3Camera:
             return None, None
 
         raw_data = self._read_raw_frame()
-        return extract_both(raw_data)
+        return extract_both(raw_data, config=self.config)
 
     def trigger_shutter(self) -> None:
         """Trigger shutter/NUC calibration."""
@@ -499,7 +571,7 @@ class P3Camera:
         if self.dev is None:
             return b""
         data = b""
-        target = HEADER_SIZE + FRAME_W * FRAME_H * 2
+        target = HEADER_SIZE + self.config.frame_w * self.config.frame_h * 2
         while len(data) < target:
             try:
                 chunk = self.dev.read(0x81, 16384, 1000)
@@ -522,7 +594,7 @@ class P3Camera:
 
     def _claim_interfaces(self) -> None:
         """Claim USB interfaces."""
-        import usb.util
+        import usb.util  # type: ignore[import-untyped]
 
         if self.dev is None:
             return

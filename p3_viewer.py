@@ -27,7 +27,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 from p3_camera import GainMode
+from p3_camera import Model
 from p3_camera import P3Camera
+from p3_camera import get_model_config
 from p3_camera import raw_to_celsius
 
 
@@ -268,8 +270,15 @@ def tnr(
 class P3Viewer:
     """P3 Thermal Camera Viewer."""
 
-    def __init__(self) -> None:
-        self.camera = P3Camera()
+    def __init__(self, model: Model | str = Model.P3) -> None:
+        """Initialize viewer.
+
+        Args:
+            model: Camera model (P1 or P3).
+        """
+        config = get_model_config(model)
+        self.camera = P3Camera(config=config)
+        self.model = config.model
         self.rotation: int = 0
         self.colormap_idx: int = ColormapID.IRONBOW
         self.mirror: bool = False
@@ -292,15 +301,17 @@ class P3Viewer:
 
     def run(self) -> None:
         """Main viewer loop."""
-        print("P3 Thermal Viewer")
+        model_name = self.model.value.upper()
+        print(f"{model_name} Thermal Viewer")
         self.camera.connect()
         name, version = self.camera.init()
         print(f"Device: {name}, Firmware: {version}")
         self.camera.start_streaming()
         print("Press 'h' for help")
 
-        cv2.namedWindow("P3 Thermal", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("P3 Thermal", 640, 480)
+        window_name = f"{model_name} Thermal"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 640, 480)
 
         try:
             while True:
@@ -314,12 +325,13 @@ class P3Viewer:
                 self._prev_frame = thermal.copy()
 
                 self._last_display = self._render(thermal)
-                cv2.imshow("P3 Thermal", self._last_display)
+                window_name = f"{self.model.value.upper()} Thermal"
+                cv2.imshow(window_name, self._last_display)
                 self._update_fps()
 
                 if not self._handle_key(thermal):
                     break
-                if cv2.getWindowProperty("P3 Thermal", cv2.WND_PROP_VISIBLE) < 1:
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                     break
         finally:
             self.camera.stop_streaming()
@@ -348,7 +360,7 @@ class P3Viewer:
         if self.agc_mode == AGCMode.FACTORY:
             # Use hardware AGC'd IR brightness from camera (already 8-bit)
             if self._ir_brightness is not None:
-                # IR is 192 rows, thermal is 190 rows - crop to match
+                # IR brightness has 2 more rows than thermal - crop to match
                 img = self._ir_brightness[2:, :].copy()
             else:
                 img = agc_temporal(thermal, pct=1.0)
@@ -594,8 +606,23 @@ class P3Viewer:
 
 def main() -> None:
     """Entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Thermal Master P3/P1 USB thermal camera viewer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["p1", "p3"],
+        default="p3",
+        help="Camera model (default: p3)",
+    )
+    args = parser.parse_args()
+
     try:
-        P3Viewer().run()
+        P3Viewer(model=args.model).run()
     except RuntimeError as e:
         print(f"Error: {e}")
     except KeyboardInterrupt:

@@ -12,6 +12,7 @@ from p3_camera import FRAME_H
 from p3_camera import FRAME_W
 from p3_camera import HEADER_SIZE
 from p3_camera import KELVIN_OFFSET
+from p3_camera import Model
 from p3_camera import TEMP_SCALE
 from p3_camera import THERMAL_ROW_END
 from p3_camera import THERMAL_ROW_START
@@ -23,6 +24,7 @@ from p3_camera import celsius_to_kelvin
 from p3_camera import celsius_to_raw
 from p3_camera import crc16_ccitt
 from p3_camera import extract_thermal_data
+from p3_camera import get_model_config
 from p3_camera import kelvin_to_celsius
 from p3_camera import raw_to_celsius
 from p3_camera import raw_to_kelvin
@@ -38,14 +40,40 @@ class TestConstants:
         assert KELVIN_OFFSET == 273.15
 
     def test_frame_dimensions(self):
+        # Default is P3
         assert FRAME_W == 256
         assert FRAME_H == 384
         assert THERMAL_ROWS == 190
 
     def test_thermal_rows(self):
+        # Default is P3
         assert THERMAL_ROW_START == 194
         assert THERMAL_ROW_END == 384
         assert THERMAL_ROW_END - THERMAL_ROW_START == THERMAL_ROWS
+
+    def test_p1_model_config(self):
+        """Test P1 model configuration."""
+        config = get_model_config(Model.P1)
+        assert config.model == Model.P1
+        assert config.pid == 0x45C2
+        assert config.frame_w == 160
+        assert config.frame_h == 240
+        assert config.ir_row_end == 120
+        assert config.thermal_row_start == 122
+        assert config.thermal_row_end == 240
+        assert config.thermal_rows == 118
+
+    def test_p3_model_config(self):
+        """Test P3 model configuration."""
+        config = get_model_config(Model.P3)
+        assert config.model == Model.P3
+        assert config.pid == 0x45A2
+        assert config.frame_w == 256
+        assert config.frame_h == 384
+        assert config.ir_row_end == 192
+        assert config.thermal_row_start == 194
+        assert config.thermal_row_end == 384
+        assert config.thermal_rows == 190
 
 
 class TestTemperatureConversion:
@@ -115,7 +143,7 @@ class TestFrameParsing:
     """Tests for frame parsing functions."""
 
     def test_extract_thermal_data_valid(self):
-        # Create synthetic frame data
+        # Create synthetic frame data (using P3 default)
         frame_size = HEADER_SIZE + FRAME_W * FRAME_H * 2
         data = bytearray(frame_size)
 
@@ -131,12 +159,29 @@ class TestFrameParsing:
         assert result.shape == (THERMAL_ROWS, FRAME_W)
         assert result[0, 0] == 20000
 
+    def test_extract_thermal_data_p1(self):
+        """Test thermal data extraction for P1 model."""
+        config = get_model_config(Model.P1)
+        frame_size = HEADER_SIZE + config.frame_w * config.frame_h * 2
+        data = bytearray(frame_size)
+
+        pixels = np.zeros((config.frame_h, config.frame_w), dtype=np.uint16)
+        pixels[config.thermal_row_start : config.thermal_row_end, :] = 20000
+
+        data[HEADER_SIZE:] = pixels.tobytes()
+        result = extract_thermal_data(bytes(data), apply_col_offset=False, config=config)
+
+        assert result is not None
+        assert result.shape == (config.thermal_rows, config.frame_w)
+        assert result[0, 0] == 20000
+
     def test_extract_thermal_data_too_short(self):
         data = b"\x00" * 100  # Way too short
         result = extract_thermal_data(data)
         assert result is None
 
     def test_extract_thermal_data_col_offset(self):
+        # Test with P3 (default)
         frame_size = HEADER_SIZE + FRAME_W * FRAME_H * 2
         data = bytearray(frame_size)
 
