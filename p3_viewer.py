@@ -372,17 +372,20 @@ class P3Viewer:
         # Optional 2x upscaling
         if self.scale_mode != ScaleMode.OFF:
             h, w = img.shape[:2]
-            img = cv2.resize(
+            resized: Any = cv2.resize(
                 img, (w * 2, h * 2), interpolation=SCALE_INTERP[self.scale_mode]
             )
+            # Ensure result is numpy array (cv2.resize may return cv2.UMat on some platforms)
+            img = np.asarray(resized, dtype=np.uint8)
 
         # Optional CLAHE for local contrast enhancement
         if self.use_clahe:
             clahe_result: Any = self._clahe.apply(img)
-            img = clahe_result
+            # Ensure result is a numpy array (CLAHE may return cv2.UMat on some platforms)
+            img = np.asarray(clahe_result, dtype=np.uint8)
 
         # DDE: edge enhancement
-        img = dde(np.asarray(img, dtype=np.uint8), strength=self.dde_strength)
+        img = dde(img, strength=self.dde_strength)
 
         # Apply colormap
         img = apply_colormap(img, self.colormap_idx)
