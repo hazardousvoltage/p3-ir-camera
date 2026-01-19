@@ -17,21 +17,24 @@ Controls:
 
 from __future__ import annotations
 
-import time
 from enum import IntEnum
-from typing import Any
-from typing import cast
+from typing import Any, cast
+
+import time
+
+from numpy.typing import NDArray
 
 import cv2
 import numpy as np
-from numpy.typing import NDArray
 
-from p3_camera import GainMode
-from p3_camera import Model
-from p3_camera import P3Camera
-from p3_camera import get_model_config
-from p3_camera import raw_to_celsius
-from p3_camera import raw_to_celsius_corrected
+from p3_camera import (
+    GainMode,
+    Model,
+    P3Camera,
+    get_model_config,
+    raw_to_celsius,
+    raw_to_celsius_corrected,
+)
 
 
 # =============================================================================

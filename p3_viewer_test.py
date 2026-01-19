@@ -5,16 +5,18 @@ from __future__ import annotations
 import sys
 
 import numpy as np
-import pytest  # type: ignore[import-untyped]
+import pytest
 
-from p3_viewer import COLORMAPS
-from p3_viewer import ColormapID
-from p3_viewer import agc_fixed
-from p3_viewer import agc_temporal
-from p3_viewer import apply_colormap
-from p3_viewer import dde
-from p3_viewer import get_colormap
-from p3_viewer import tnr
+from p3_viewer import (
+    COLORMAPS,
+    ColormapID,
+    agc_fixed,
+    agc_temporal,
+    apply_colormap,
+    dde,
+    get_colormap,
+    tnr,
+)
 
 
 class TestColormaps:

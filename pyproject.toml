@@ -54,19 +54,45 @@ show-fixes = true
 line-length = 88
 output-format = "concise"
 target-version = "py310"
+exclude = [".venv", "*.egg-info", ".pytest_cache", "build", "dist"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-force-single-line = true
+case-sensitive = false
+combine-as-imports = true
+force-wrap-aliases = true
+split-on-trailing-comma = true
+default-section = "third-party"
+detect-same-package = true
+force-single-line = false
+force-sort-within-sections = false
+from-first = true
+lines-between-types = 1
 lines-after-imports = 2
+no-lines-before = ["future"]
+order-by-type = true
+relative-imports-order = "closest-to-furthest"
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "first-party",
+    "local-folder",
+]
 
 [tool.basedpyright]
 typeCheckingMode = "standard"
+exclude = [".venv", "*.egg-info", ".pytest_cache", "build", "dist"]
+ignore = [".venv", "*.egg-info", ".pytest_cache", "build", "dist"]
+stubPath = ".typings"
+pythonPlatform = "Linux"
 pythonVersion = "3.10"
 
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["*_test.py"]
+addopts = "-Werror"
+norecursedirs = [".venv", "__pycache__", "*.egg-info"]

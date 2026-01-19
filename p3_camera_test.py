@@ -5,39 +5,41 @@ from __future__ import annotations
 import sys
 
 import numpy as np
-import pytest  # type: ignore[import-untyped]
+import pytest
 
-from p3_camera import CNT3_INCREMENT
-from p3_camera import CNT3_WRAP
-from p3_camera import COMMANDS
-from p3_camera import KELVIN_OFFSET
-from p3_camera import MARKER_DTYPE
-from p3_camera import MARKER_SIZE
-from p3_camera import SYNC_END_EVEN
-from p3_camera import SYNC_END_ODD
-from p3_camera import SYNC_START_EVEN
-from p3_camera import SYNC_START_ODD
-from p3_camera import TEMP_SCALE
-from p3_camera import EnvParams
-from p3_camera import FrameIncompleteError
-from p3_camera import FrameMarkerMismatchError
-from p3_camera import FrameStats
-from p3_camera import GainMode
-from p3_camera import Model
-from p3_camera import apply_emissivity_correction
-from p3_camera import build_command
-from p3_camera import celsius_to_kelvin
-from p3_camera import celsius_to_raw
-from p3_camera import crc16_ccitt
-from p3_camera import extract_both
-from p3_camera import extract_ir_brightness
-from p3_camera import extract_thermal_data
-from p3_camera import get_model_config
-from p3_camera import kelvin_to_celsius
-from p3_camera import parse_marker
-from p3_camera import raw_to_celsius
-from p3_camera import raw_to_celsius_corrected
-from p3_camera import raw_to_kelvin
+from p3_camera import (
+    CNT3_INCREMENT,
+    CNT3_WRAP,
+    COMMANDS,
+    KELVIN_OFFSET,
+    MARKER_DTYPE,
+    MARKER_SIZE,
+    SYNC_END_EVEN,
+    SYNC_END_ODD,
+    SYNC_START_EVEN,
+    SYNC_START_ODD,
+    TEMP_SCALE,
+    EnvParams,
+    FrameIncompleteError,
+    FrameMarkerMismatchError,
+    FrameStats,
+    GainMode,
+    Model,
+    apply_emissivity_correction,
+    build_command,
+    celsius_to_kelvin,
+    celsius_to_raw,
+    crc16_ccitt,
+    extract_both,
+    extract_ir_brightness,
+    extract_thermal_data,
+    get_model_config,
+    kelvin_to_celsius,
+    parse_marker,
+    raw_to_celsius,
+    raw_to_celsius_corrected,
+    raw_to_kelvin,
+)
 
 
 class TestConstants:
@@ -179,8 +181,12 @@ class TestEmissivityCorrection:
         """When apparent > reflected, lower emissivity gives higher corrected temp."""
         # Object at 50°C (323.15K), reflected at 25°C (298.15K)
         temp_k = 323.15
-        result_95 = apply_emissivity_correction(temp_k, emissivity=0.95, reflected_temp_c=25.0)
-        result_80 = apply_emissivity_correction(temp_k, emissivity=0.80, reflected_temp_c=25.0)
+        result_95 = apply_emissivity_correction(
+            temp_k, emissivity=0.95, reflected_temp_c=25.0
+        )
+        result_80 = apply_emissivity_correction(
+            temp_k, emissivity=0.80, reflected_temp_c=25.0
+        )
         # Lower emissivity = object is hotter than it appears
         assert result_80 > result_95 > temp_k
 
@@ -188,7 +194,9 @@ class TestEmissivityCorrection:
         """Test emissivity correction works with arrays."""
         # All temps above reflected (25°C = 298.15K)
         temps_k = np.array([310.0, 320.0, 330.0], dtype=np.float32)
-        result = apply_emissivity_correction(temps_k, emissivity=0.95, reflected_temp_c=25.0)
+        result = apply_emissivity_correction(
+            temps_k, emissivity=0.95, reflected_temp_c=25.0
+        )
         assert isinstance(result, np.ndarray)
         assert result.shape == (3,)
         assert result.dtype == np.float32
@@ -197,7 +205,11 @@ class TestEmissivityCorrection:
         """When apparent = reflected, correction has no effect."""
         reflected_c = 25.0
         temp_k = reflected_c + 273.15  # Same as reflected
-        result = apply_emissivity_correction(temp_k, emissivity=0.95, reflected_temp_c=reflected_c)
+        result = apply_emissivity_correction(
+            temp_k,
+            emissivity=0.95,
+            reflected_temp_c=reflected_c,
+        )
         assert result == pytest.approx(temp_k, rel=1e-3)
 
     def test_raw_to_celsius_corrected_with_env(self):

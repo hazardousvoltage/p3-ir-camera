@@ -13,18 +13,18 @@ See: https://github.com/jvdillon/p3-ir-camera/issues/2
 
 from __future__ import annotations
 
+from enum import Enum, IntEnum
+from typing import TYPE_CHECKING, Any
+
 import array
 import contextlib
+import dataclasses
 import struct
 import time
-from dataclasses import dataclass
-from dataclasses import field
-from enum import Enum
-from enum import IntEnum
-from typing import TYPE_CHECKING
-from typing import Any
 
 import numpy as np
+import usb.core
+import usb.util
 
 
 if TYPE_CHECKING:
@@ -79,7 +79,7 @@ class Model(str, Enum):
     P3 = "p3"  # 256×192 resolution, PID=0x45A2
 
 
-@dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
 class ModelConfig:
     """Model-specific configuration."""
 
@@ -152,7 +152,7 @@ class GainMode(IntEnum):
     AUTO = 2  # Auto-switching between HIGH and LOW
 
 
-@dataclass(slots=True)
+@dataclasses.dataclass(kw_only=True, slots=True)
 class EnvParams:
     """Environmental parameters for temperature correction."""
 
@@ -163,7 +163,7 @@ class EnvParams:
     humidity: float = 0.5  # Relative humidity (0.0-1.0)
 
 
-@dataclass(slots=True)
+@dataclasses.dataclass(kw_only=True, slots=True)
 class FrameStats:
     """Frame statistics for tracking and validation."""
 
@@ -179,32 +179,48 @@ class FrameStats:
 # CRC values from USB traffic analysis by @aeternium.
 COMMANDS: dict[str, bytes] = {
     # Register reads (0x0101 command type)
+    # reg 0x01, 30 bytes
     "read_name": bytes.fromhex(
-        "0101810001000000000000001e0000004f90"
-    ),  # reg 0x01, 30 bytes
+        "0101810001000000000000001e0000004f90",
+    ),
+    # reg 0x02, 12 bytes
     "read_version": bytes.fromhex(
-        "0101810002000000000000000c0000001f63"
-    ),  # reg 0x02, 12 bytes
+        "0101810002000000000000000c0000001f63",
+    ),
+    # reg 0x06, 64 bytes
     "read_part_number": bytes.fromhex(
-        "01018100060000000000000040000000654f"
-    ),  # reg 0x06, 64 bytes
+        "01018100060000000000000040000000654f",
+    ),
+    # reg 0x07, 64 bytes
     "read_serial": bytes.fromhex(
-        "01018100070000000000000040000000104c"
-    ),  # reg 0x07, 64 bytes
+        "01018100070000000000000040000000104c",
+    ),
+    # reg 0x0a, 64 bytes
     "read_hw_version": bytes.fromhex(
-        "010181000a00000000000000400000001959"
-    ),  # reg 0x0a, 64 bytes
+        "010181000a00000000000000400000001959",
+    ),
+    # reg 0x0f, 64 bytes
     "read_model_long": bytes.fromhex(
-        "010181000f0000000000000040000000b857"
-    ),  # reg 0x0f, 64 bytes
+        "010181000f0000000000000040000000b857",
+    ),
     # Status (0x1021 command type)
-    "status": bytes.fromhex("1021810000000000000000000200000095d1"),
+    "status": bytes.fromhex(
+        "1021810000000000000000000200000095d1",
+    ),
     # Stream control (0x012f command type)
-    "start_stream": bytes.fromhex("012f81000000000000000000010000004930"),
-    "gain_low": bytes.fromhex("012f41000000000000000000000000003c3a"),
-    "gain_high": bytes.fromhex("012f41000100000000000000000000004939"),
+    "start_stream": bytes.fromhex(
+        "012f81000000000000000000010000004930",
+    ),
+    "gain_low": bytes.fromhex(
+        "012f41000000000000000000000000003c3a",
+    ),
+    "gain_high": bytes.fromhex(
+        "012f41000100000000000000000000004939",
+    ),
     # Shutter (0x0136 command type)
-    "shutter": bytes.fromhex("01364300000000000000000000000000cd0b"),
+    "shutter": bytes.fromhex(
+        "01364300000000000000000000000000cd0b",
+    ),
 }
 
 
@@ -559,7 +575,7 @@ def build_command(
 # =============================================================================
 
 
-@dataclass(slots=True)
+@dataclasses.dataclass(kw_only=True, slots=True)
 class P3Camera:
     """P3 Thermal Camera interface.
 
@@ -569,16 +585,17 @@ class P3Camera:
     dev: Any = None  # usb.core.Device
     streaming: bool = False
     gain_mode: GainMode = GainMode.HIGH
-    env_params: EnvParams = field(default_factory=EnvParams)
-    config: ModelConfig = field(default_factory=lambda: _DEFAULT_CONFIG)
-    stats: FrameStats = field(default_factory=FrameStats)
+    env_params: EnvParams = dataclasses.field(default_factory=EnvParams)
+    config: ModelConfig = dataclasses.field(default_factory=lambda: _DEFAULT_CONFIG)
+    stats: FrameStats = dataclasses.field(default_factory=FrameStats)
     validate_markers: bool = True  # Enable marker validation (cnt1 matching)
-    _frame_buf: Any = field(default=None, repr=False)  # array.array for frame reads
+    _frame_buf: Any = dataclasses.field(
+        default=None,
+        repr=False,
+    )  # array.array for frame reads
 
     def connect(self) -> None:
         """Connect to the camera."""
-        import usb.core  # type: ignore[import-untyped]
-        import usb.util  # type: ignore[import-untyped]
 
         self.dev = usb.core.find(idVendor=VID, idProduct=self.config.pid)
         if self.dev is None:
@@ -931,8 +948,6 @@ class P3Camera:
 
     def _claim_interfaces(self) -> None:
         """Claim USB interfaces."""
-        import usb.util  # type: ignore[import-untyped]
-
         if self.dev is None:
             return
         self.dev.set_configuration()
