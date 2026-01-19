@@ -3,7 +3,7 @@
 Protocol documentation for P3-series USB thermal cameras.
 
 > **Note**: Protocol details determined through USB traffic analysis.
-> Primary research by [@aeternium](https://github.com/jvdillon/p3-ir-camera/issues/2).
+> Additional research by [@aeternium](https://github.com/jvdillon/p3-ir-camera/issues/2).
 
 ## Supported Devices
 
