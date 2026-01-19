@@ -360,8 +360,7 @@ class P3Viewer:
         if self.agc_mode == AGCMode.FACTORY:
             # Use hardware AGC'd IR brightness from camera (already 8-bit)
             if self._ir_brightness is not None:
-                # IR brightness has 2 more rows than thermal - crop to match
-                img = self._ir_brightness[2:, :].copy()
+                img = self._ir_brightness.copy()
             else:
                 img = agc_temporal(thermal, pct=1.0)
         elif self.agc_mode == AGCMode.FIXED_RANGE:

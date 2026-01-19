@@ -3,11 +3,18 @@
 USB protocol, frame parsing, temperature conversion, and calibration for
 P3-series USB thermal cameras.
 
-Device: VID=0x3474, PID=0x45C2, 160×120 native resolution.
+Supports:
+- P3: VID=0x3474, PID=0x45A2, 256×192 resolution
+- P1: VID=0x3474, PID=0x45C2, 160×120 resolution
+
+Protocol details based on USB traffic analysis by @aeternium.
+See: https://github.com/jvdillon/p3-ir-camera/issues/2
 """
 
 from __future__ import annotations
 
+import array
+import contextlib
 import struct
 import time
 from dataclasses import dataclass
@@ -16,7 +23,6 @@ from enum import Enum
 from enum import IntEnum
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import TypeVar
 
 import numpy as np
 
@@ -24,14 +30,46 @@ import numpy as np
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
-_ArrT = TypeVar("_ArrT", bound="NDArray[Any]")
-
 # Device constants
 VID = 0x3474
-HEADER_SIZE = 12
+MARKER_SIZE = 12
 # Temperature conversion constants
 TEMP_SCALE = 64  # Raw values are in 1/64 Kelvin units
 KELVIN_OFFSET = 273.15
+
+
+class FrameIncompleteError(Exception):
+    """Raised when a frame read returns fewer bytes than expected."""
+
+    pass
+
+
+class FrameMarkerMismatchError(Exception):
+    """Raised when start and end frame markers don't match (cnt1 mismatch)."""
+
+    pass
+
+
+# Frame marker dtype for parsing start/end markers
+MARKER_DTYPE = np.dtype(
+    [
+        ("length", "<u1"),  # Always 12
+        ("sync", "<u1"),  # 0x8c/0x8d for start, 0x8e/0x8f for end
+        ("cnt1", "<u4"),  # Frame counter (same in start/end)
+        ("cnt2", "<u4"),  # Secondary counter
+        ("cnt3", "<u2"),  # Wrapping counter (mod 2048, increments ~40/frame)
+    ]
+)
+
+# Marker sync byte values
+SYNC_START_EVEN = 0x8C  # Start marker, even frame
+SYNC_START_ODD = 0x8D  # Start marker, odd frame
+SYNC_END_EVEN = 0x8E  # End marker, even frame
+SYNC_END_ODD = 0x8F  # End marker, odd frame
+
+# Expected cnt3 increment per frame (~40, wraps at 2048)
+CNT3_INCREMENT = 40
+CNT3_WRAP = 2048
 
 
 class Model(str, Enum):
@@ -47,16 +85,33 @@ class ModelConfig:
 
     model: Model
     pid: int
-    frame_w: int
-    frame_h: int
-    ir_row_end: int
-    thermal_row_start: int
-    thermal_row_end: int
+    sensor_w: int  # Sensor width (columns)
+    sensor_h: int  # Sensor height (rows) - same for IR and thermal
 
     @property
-    def thermal_rows(self) -> int:
-        """Number of thermal rows."""
-        return self.thermal_row_end - self.thermal_row_start
+    def frame_rows(self) -> int:
+        """Total rows in frame: IR + 2 metadata + thermal."""
+        return 2 * self.sensor_h + 2
+
+    @property
+    def frame_size(self) -> int:
+        """Frame data size in bytes (excluding markers)."""
+        return 2 * self.frame_rows * self.sensor_w
+
+    @property
+    def ir_row_end(self) -> int:
+        """End row for IR data (exclusive)."""
+        return self.sensor_h
+
+    @property
+    def thermal_row_start(self) -> int:
+        """Start row for thermal data."""
+        return self.sensor_h + 2
+
+    @property
+    def thermal_row_end(self) -> int:
+        """End row for thermal data (exclusive)."""
+        return 2 * self.sensor_h + 2
 
 
 def get_model_config(model: Model | str = Model.P3) -> ModelConfig:
@@ -73,33 +128,20 @@ def get_model_config(model: Model | str = Model.P3) -> ModelConfig:
         return ModelConfig(
             model=Model.P1,
             pid=0x45C2,
-            frame_w=160,
-            frame_h=240,  # (120 IR + 2 info + 118 temp) = 240 rows
-            ir_row_end=120,
-            thermal_row_start=122,
-            thermal_row_end=240,
+            sensor_w=160,
+            sensor_h=120,  # 120 IR + 2 metadata + 120 thermal = 242 rows
         )
     else:  # P3
         return ModelConfig(
             model=Model.P3,
             pid=0x45A2,
-            frame_w=256,
-            frame_h=384,  # (192 IR + 2 info + 190 temp) = 384 rows
-            ir_row_end=192,
-            thermal_row_start=194,
-            thermal_row_end=384,
+            sensor_w=256,
+            sensor_h=192,  # 192 IR + 2 metadata + 192 thermal = 386 rows
         )
 
 
-# Default model config (P3 for backward compatibility)
+# Default model config
 _DEFAULT_CONFIG = get_model_config(Model.P3)
-FRAME_W = _DEFAULT_CONFIG.frame_w
-FRAME_H = _DEFAULT_CONFIG.frame_h
-IR_ROW_START = 0
-IR_ROW_END = _DEFAULT_CONFIG.ir_row_end
-THERMAL_ROW_START = _DEFAULT_CONFIG.thermal_row_start
-THERMAL_ROW_END = _DEFAULT_CONFIG.thermal_row_end
-THERMAL_ROWS = _DEFAULT_CONFIG.thermal_rows
 
 
 class GainMode(IntEnum):
@@ -121,16 +163,47 @@ class EnvParams:
     humidity: float = 0.5  # Relative humidity (0.0-1.0)
 
 
+@dataclass(slots=True)
+class FrameStats:
+    """Frame statistics for tracking and validation."""
+
+    frames_read: int = 0  # Total frames successfully read
+    frames_dropped: int = 0  # Frames dropped due to cnt3 gaps
+    marker_mismatches: int = 0  # Frames with cnt1 mismatch (still returned)
+    last_cnt1: int = 0  # Last frame's cnt1 value
+    last_cnt3: int = 0  # Last frame's cnt3 value (for drop detection)
+
+
 # Pre-computed USB commands with CRC
+# Note: Camera does not verify CRCs, but we include correct ones anyway.
+# CRC values from USB traffic analysis by @aeternium.
 COMMANDS: dict[str, bytes] = {
-    "read_name": bytes.fromhex("0101810001000000000000001e0000004f90"),
-    "read_version": bytes.fromhex("0101810002000000000000000c0000001f63"),
-    "read_model": bytes.fromhex("010181000600000000000000400000004f65"),
-    "read_serial": bytes.fromhex("01018100070000000000000040000000104c"),
-    "status": bytes.fromhex("102181000000000000000000020000009501"),
-    "start_stream": bytes.fromhex("012f8100000000000000000001000000493f"),
+    # Register reads (0x0101 command type)
+    "read_name": bytes.fromhex(
+        "0101810001000000000000001e0000004f90"
+    ),  # reg 0x01, 30 bytes
+    "read_version": bytes.fromhex(
+        "0101810002000000000000000c0000001f63"
+    ),  # reg 0x02, 12 bytes
+    "read_part_number": bytes.fromhex(
+        "01018100060000000000000040000000654f"
+    ),  # reg 0x06, 64 bytes
+    "read_serial": bytes.fromhex(
+        "01018100070000000000000040000000104c"
+    ),  # reg 0x07, 64 bytes
+    "read_hw_version": bytes.fromhex(
+        "010181000a00000000000000400000001959"
+    ),  # reg 0x0a, 64 bytes
+    "read_model_long": bytes.fromhex(
+        "010181000f0000000000000040000000b857"
+    ),  # reg 0x0f, 64 bytes
+    # Status (0x1021 command type)
+    "status": bytes.fromhex("1021810000000000000000000200000095d1"),
+    # Stream control (0x012f command type)
+    "start_stream": bytes.fromhex("012f81000000000000000000010000004930"),
     "gain_low": bytes.fromhex("012f41000000000000000000000000003c3a"),
-    "gain_high": bytes.fromhex("012f4100010000000000000000000000493f"),
+    "gain_high": bytes.fromhex("012f41000100000000000000000000004939"),
+    # Shutter (0x0136 command type)
     "shutter": bytes.fromhex("01364300000000000000000000000000cd0b"),
 }
 
@@ -216,76 +289,50 @@ def celsius_to_raw(celsius: float) -> int:
 # =============================================================================
 
 
-def _fix_alignment_quirk(img: _ArrT) -> _ArrT:
-    """Fix column alignment quirk in P-series camera data.
+def parse_marker(data: bytes) -> np.ndarray:
+    """Parse a 12-byte frame marker.
 
-    The P3 camera has a hardware quirk where the first 12 columns of each row
-    are transmitted at the end of the previous row's USB data. This appears to
-    be a sensor readout timing issue: the sensor starts reading at column 12,
-    wraps to columns 0-11, but USB transfer packs data linearly.
+    Args:
+        data: 12-byte marker data.
 
-    This causes:
-    1. Columns 0-11 to appear shifted up by one row relative to columns 12-159 (P1) or 12-255 (P3)
-    2. The last row of columns 0-11 to contain garbage (no source data)
-
-    Fix:
-    1. Roll image left by 12 columns (moves cols 0-11 to cols 148-159 for P1 or 244-255 for P3)
-    2. Roll those 12 columns up by 1 row to realign with the rest
-    3. Copy second-to-last row over last row to hide garbage
-
-    The 12-column (24-byte) offset suggests DMA/USB buffer alignment boundary.
-    Note: This quirk may be specific to P3; P1 may not require this fix.
+    Returns:
+        Structured numpy array with marker fields.
     """
-    col_offset = -12
-    row_shift = -1
-
-    result = np.roll(img, col_offset, axis=1)
-    n_edge = abs(col_offset)
-    result[:, -n_edge:] = np.roll(result[:, -n_edge:], row_shift, axis=0)
-    result[-1, -n_edge:] = result[-2, -n_edge:]
-    return result
+    return np.frombuffer(data, dtype=MARKER_DTYPE)
 
 
 def extract_thermal_data(
     frame_data: bytes,
-    apply_col_offset: bool = True,
     config: ModelConfig | None = None,
 ) -> NDArray[np.uint16] | None:
     """Extract temperature image from raw frame data.
 
     Args:
-        frame_data: Raw USB frame data.
-        apply_col_offset: Whether to apply column alignment fix.
+        frame_data: Raw USB frame data (with start marker).
         config: Model configuration (defaults to P3).
 
     Returns:
         Temperature image as uint16 array, or None if invalid.
-
     """
     if config is None:
         config = _DEFAULT_CONFIG
-    expected_size = HEADER_SIZE + config.frame_w * config.frame_h * 2
+    expected_size = MARKER_SIZE + config.frame_size
     if len(frame_data) < expected_size:
         return None
 
     pixels = np.frombuffer(
-        frame_data[HEADER_SIZE : HEADER_SIZE + config.frame_w * config.frame_h * 2],
+        frame_data[MARKER_SIZE : MARKER_SIZE + config.frame_size],
         dtype="<u2",
     )
-    full_frame = pixels.reshape((config.frame_h, config.frame_w))
+    full_frame = pixels.reshape((config.frame_rows, config.sensor_w))
 
     # Extract thermal region
     thermal = full_frame[config.thermal_row_start : config.thermal_row_end, :].copy()
-
-    if apply_col_offset:
-        thermal = _fix_alignment_quirk(thermal)
-
     return thermal
 
 
 def extract_ir_brightness(
     frame_data: bytes,
-    apply_col_offset: bool = True,
     config: ModelConfig | None = None,
 ) -> NDArray[np.uint8] | None:
     """Extract IR brightness image from raw frame data.
@@ -294,76 +341,61 @@ def extract_ir_brightness(
     value. This data is hardware AGC'd by the camera.
 
     Args:
-        frame_data: Raw USB frame data.
-        apply_col_offset: Whether to apply column alignment fix.
+        frame_data: Raw USB frame data (with start marker).
         config: Model configuration (defaults to P3).
 
     Returns:
         IR brightness image as uint8 array, or None if invalid.
-
     """
     if config is None:
         config = _DEFAULT_CONFIG
-    expected_size = HEADER_SIZE + config.frame_w * config.frame_h * 2
+    expected_size = MARKER_SIZE + config.frame_size
     if len(frame_data) < expected_size:
         return None
 
     pixels = np.frombuffer(
-        frame_data[HEADER_SIZE : HEADER_SIZE + config.frame_w * config.frame_h * 2],
+        frame_data[MARKER_SIZE : MARKER_SIZE + config.frame_size],
         dtype="<u2",
     )
-    full_frame = pixels.reshape((config.frame_h, config.frame_w))
+    full_frame = pixels.reshape((config.frame_rows, config.sensor_w))
 
-    # Extract IR brightness region
-    ir_16bit = full_frame[IR_ROW_START : config.ir_row_end, :].copy()
-
-    # Low byte contains 8-bit brightness
+    # Extract IR brightness region (low byte contains 8-bit brightness)
+    ir_16bit = full_frame[: config.ir_row_end, :].copy()
     ir_8bit = (ir_16bit & 0xFF).astype(np.uint8)
-
-    if apply_col_offset:
-        ir_8bit = _fix_alignment_quirk(ir_8bit)
-
     return ir_8bit
 
 
 def extract_both(
     frame_data: bytes,
-    apply_col_offset: bool = True,
     config: ModelConfig | None = None,
 ) -> tuple[NDArray[np.uint8] | None, NDArray[np.uint16] | None]:
     """Extract both IR brightness and temperature data from frame.
 
     Args:
-        frame_data: Raw USB frame data.
-        apply_col_offset: Whether to apply column alignment fix.
+        frame_data: Raw USB frame data (with start marker).
         config: Model configuration (defaults to P3).
 
     Returns:
         Tuple of (ir_brightness, temperature), either can be None on error.
-
     """
     if config is None:
         config = _DEFAULT_CONFIG
-    expected_size = HEADER_SIZE + config.frame_w * config.frame_h * 2
+    expected_size = MARKER_SIZE + config.frame_size
     if len(frame_data) < expected_size:
         return None, None
 
     pixels = np.frombuffer(
-        frame_data[HEADER_SIZE : HEADER_SIZE + config.frame_w * config.frame_h * 2],
+        frame_data[MARKER_SIZE : MARKER_SIZE + config.frame_size],
         dtype="<u2",
     )
-    full_frame = pixels.reshape((config.frame_h, config.frame_w))
+    full_frame = pixels.reshape((config.frame_rows, config.sensor_w))
 
     # IR brightness (low byte)
-    ir_16bit = full_frame[IR_ROW_START : config.ir_row_end, :].copy()
+    ir_16bit = full_frame[: config.ir_row_end, :].copy()
     ir_8bit = (ir_16bit & 0xFF).astype(np.uint8)
 
     # Temperature
     thermal = full_frame[config.thermal_row_start : config.thermal_row_end, :].copy()
-
-    if apply_col_offset:
-        ir_8bit = _fix_alignment_quirk(ir_8bit)
-        thermal = _fix_alignment_quirk(thermal)
 
     return ir_8bit, thermal
 
@@ -452,6 +484,9 @@ class P3Camera:
     gain_mode: GainMode = GainMode.HIGH
     env_params: EnvParams = field(default_factory=EnvParams)
     config: ModelConfig = field(default_factory=lambda: _DEFAULT_CONFIG)
+    stats: FrameStats = field(default_factory=FrameStats)
+    validate_markers: bool = True  # Enable marker validation (cnt1 matching)
+    _frame_buf: Any = field(default=None, repr=False)  # array.array for frame reads
 
     def connect(self) -> None:
         """Connect to the camera."""
@@ -461,9 +496,13 @@ class P3Camera:
         self.dev = usb.core.find(idVendor=VID, idProduct=self.config.pid)
         if self.dev is None:
             model_name = self.config.model.value.upper()
-            raise RuntimeError(f"{model_name} camera not found (PID=0x{self.config.pid:04X})")
+            raise RuntimeError(
+                f"{model_name} camera not found (PID=0x{self.config.pid:04X})"
+            )
         self._detach_kernel_drivers()
         self._claim_interfaces()
+        # Pre-allocate frame buffer for efficient reads
+        self._frame_buf = array.array("B", [0]) * self.config.frame_size
 
     def disconnect(self) -> None:
         """Disconnect from the camera."""
@@ -476,34 +515,135 @@ class P3Camera:
 
         Returns:
             Tuple of (device_name, firmware_version).
-
         """
         if self.dev is None:
             raise RuntimeError("Not connected")
 
         self._send_command(COMMANDS["read_name"])
-        time.sleep(0.02)
+        self._read_status()  # ACK
         name = bytes(self._read_response(30))
+        self._read_status()  # ACK
         name_str = name.rstrip(b"\x00").decode(errors="replace")
 
         self._send_command(COMMANDS["read_version"])
-        time.sleep(0.02)
+        self._read_status()  # ACK
         version = bytes(self._read_response(12))
+        self._read_status()  # ACK
         version_str = version.rstrip(b"\x00").decode(errors="replace")
-
-        self._send_command(COMMANDS["status"])
-        self._read_status()
 
         return name_str, version_str
 
-    def start_streaming(self) -> None:
-        """Start video streaming."""
+    def read_register(self, cmd_name: str, length: int) -> str:
+        """Read a register and return decoded string.
+
+        Args:
+            cmd_name: Command name from COMMANDS dict.
+            length: Expected response length.
+
+        Returns:
+            Register value as string (null-terminated).
+        """
         if self.dev is None:
             raise RuntimeError("Not connected")
+        self._send_command(COMMANDS[cmd_name])
+        self._read_status()  # ACK after write
+        data = bytes(self._read_response(length))
+        self._read_status()  # ACK after read
+        return data.rstrip(b"\x00").decode(errors="replace")
+
+    def read_device_info(self) -> dict[str, str]:
+        """Read all device information registers.
+
+        Returns:
+            Dictionary with device info:
+            - model: Model name (e.g., "P3")
+            - fw_version: Firmware version (e.g., "00.00.02.17")
+            - part_number: Part number (e.g., "P30-1Axxxxxxxx")
+            - serial: Serial number
+            - hw_version: Hardware revision (e.g., "P3-00.04")
+            - model_long: Model name (64-byte version)
+        """
+        if self.dev is None:
+            raise RuntimeError("Not connected")
+        return {
+            "model": self.read_register("read_name", 30),
+            "fw_version": self.read_register("read_version", 12),
+            "part_number": self.read_register("read_part_number", 64),
+            "serial": self.read_register("read_serial", 64),
+            "hw_version": self.read_register("read_hw_version", 64),
+            "model_long": self.read_register("read_model_long", 64),
+        }
+
+    def read_status_command(self) -> str:
+        """Read the status command register (0x00).
+
+        This returns a 2-byte status that typically contains "11" (0x31 0x31).
+
+        Returns:
+            Status value as string.
+        """
+        if self.dev is None:
+            raise RuntimeError("Not connected")
+        self._send_command(COMMANDS["status"])
+        self._read_status()  # ACK after write
+        data = bytes(self._read_response(2))
+        self._read_status()  # ACK after read
+        return data.decode(errors="replace")
+
+    def start_streaming(self) -> None:
+        """Start video streaming.
+
+        Follows the sequence observed from the Windows Temp Master tool:
+        1. Send start_stream command and check status
+        2. Wait 1 second
+        3. Set interface alternate setting
+        4. Send 0xEE control transfer
+        5. Wait 2 seconds for camera to be ready
+        6. Issue async bulk read (Windows tool does this)
+        7. Send start_stream command again
+        """
+        if self.dev is None:
+            raise RuntimeError("Not connected")
+
+        # Reset frame statistics
+        self.stats = FrameStats()
+
+        # Initial start_stream with status checks
+        self._send_command(COMMANDS["start_stream"])
+        self._read_status()  # reads 0x02
+        resp = self._read_response(1)  # reads 0x01 (or 0x35 if restarting)
+        self._read_status()  # reads 0x03
+
+        # Check for restart response (0x35 = '5' when stream was already active)
+        if resp and resp[0] == 0x35:
+            # Camera was already streaming, this is a restart
+            pass  # Continue with sequence
+
+        # Wait before configuring interface (per Windows tool timing)
+        time.sleep(1.0)
+
+        # Configure streaming interface
         self.dev.set_interface_altsetting(interface=1, alternate_setting=1)
         self.dev.ctrl_transfer(0x40, 0xEE, 0, 1, None, 1000)
+
+        # Wait for camera to be ready (Windows tool waits ~2 seconds)
+        time.sleep(2.0)
+
+        # Issue async bulk read before final start_stream (per Windows tool)
+        # This read happens asynchronously in the Windows tool
+        with contextlib.suppress(Exception):
+            self.dev.read(0x81, self.config.frame_size, 100)
+
+        # Final start_stream with status checks
         self._send_command(COMMANDS["start_stream"])
-        time.sleep(0.1)
+        self._read_status()
+        resp = self._read_response(1)
+        self._read_status()
+
+        # Handle restart response on final start_stream too
+        if resp and resp[0] == 0x35:
+            pass  # Camera acknowledges restart
+
         self.streaming = True
 
     def stop_streaming(self) -> None:
@@ -511,6 +651,85 @@ class P3Camera:
         if self.streaming and self.dev is not None:
             self.dev.set_interface_altsetting(interface=1, alternate_setting=0)
             self.streaming = False
+
+    def read_frame(self) -> bytes:
+        """Read a complete frame from the camera.
+
+        Frames are transmitted as 3 USB bulk transfers:
+        1. Main frame data (frame_size bytes): start marker (12) + pixel data (frame_size - 12)
+        2. Remaining pixel data (12 bytes)
+        3. End marker (12 bytes)
+
+        The first transfer includes the 12-byte start marker at the beginning,
+        so it contains frame_size - 12 bytes of actual pixel data. The second
+        transfer provides the remaining 12 bytes of pixel data.
+
+        Frame markers are validated:
+        - cnt1 must match between start and end markers (same frame)
+        - cnt3 is tracked to detect dropped frames (~40 increment per frame)
+
+        Returns:
+            Complete frame: start marker (12) + pixel data (frame_size).
+
+        Raises:
+            FrameIncompleteError: If fewer bytes than expected were read.
+            FrameMarkerMismatchError: If cnt1 doesn't match (when validate_markers=True).
+        """
+        if self.dev is None or not self.streaming:
+            return b""
+
+        frame_size = self.config.frame_size
+
+        # Read main frame data into pre-allocated buffer
+        # This includes: start marker (12) + partial pixel data (frame_size - 12)
+        # Using array.array allows us to detect short reads
+        n = self.dev.read(0x81, self._frame_buf, 10000)
+        if n != frame_size:
+            raise FrameIncompleteError(f"Read {n} bytes, expected {frame_size}")
+
+        # Read remaining 12 bytes of pixel data (transferred separately)
+        remaining = bytes(self.dev.read(0x81, MARKER_SIZE, 1000))
+
+        # Read end marker for validation
+        end_marker_bytes = bytes(self.dev.read(0x81, MARKER_SIZE, 1000))
+
+        # Parse start and end markers
+        start_marker = parse_marker(bytes(self._frame_buf[:MARKER_SIZE]))
+        end_marker = parse_marker(end_marker_bytes)
+
+        start_cnt1 = int(start_marker["cnt1"][0])
+        end_cnt1 = int(end_marker["cnt1"][0])
+        frame_cnt3 = int(end_marker["cnt3"][0])
+
+        # Validate cnt1 matches between start and end markers
+        if start_cnt1 != end_cnt1:
+            self.stats.marker_mismatches += 1
+            if self.validate_markers:
+                raise FrameMarkerMismatchError(
+                    f"cnt1 mismatch: start={start_cnt1}, end={end_cnt1}"
+                )
+
+        # Track dropped frames via cnt3 gaps
+        # cnt3 increments by ~40 per frame and wraps at 2048
+        if self.stats.frames_read > 0:
+            expected_cnt3 = (self.stats.last_cnt3 + CNT3_INCREMENT) % CNT3_WRAP
+            # Allow some tolerance (~10) for timing variations
+            cnt3_diff = (frame_cnt3 - expected_cnt3) % CNT3_WRAP
+            if (
+                cnt3_diff > CNT3_INCREMENT // 2
+                and cnt3_diff < CNT3_WRAP - CNT3_INCREMENT
+            ):
+                # Gap detected - estimate dropped frames
+                dropped = cnt3_diff // CNT3_INCREMENT
+                self.stats.frames_dropped += dropped
+
+        # Update statistics
+        self.stats.frames_read += 1
+        self.stats.last_cnt1 = start_cnt1
+        self.stats.last_cnt3 = frame_cnt3
+
+        # Return complete frame: start marker + all pixel data
+        return bytes(self._frame_buf) + remaining
 
     def read_frame_both(
         self,
@@ -520,30 +739,41 @@ class P3Camera:
         Returns:
             Tuple of (ir_brightness uint8, temperature uint16).
             Either can be None on error.
-
         """
         if self.dev is None or not self.streaming:
             return None, None
 
-        raw_data = self._read_raw_frame()
-        return extract_both(raw_data, config=self.config)
+        try:
+            raw_data = self.read_frame()
+            return extract_both(raw_data, config=self.config)
+        except FrameIncompleteError:
+            return None, None
 
     def trigger_shutter(self) -> None:
-        """Trigger shutter/NUC calibration."""
+        """Trigger shutter/NUC calibration.
+
+        The shutter command uses param 0x43 and has no response data.
+        The camera automatically triggers shutter approximately every 90 seconds.
+        """
         self._send_command(COMMANDS["shutter"])
+        self._read_status()  # ACK after write
 
     def set_gain_mode(self, mode: GainMode) -> None:
         """Set sensor gain mode.
 
+        Gain commands use param 0x41 instead of 0x81 and have no response data.
+        We still follow the status ACK pattern for consistency.
+
         Args:
             mode: Gain mode (LOW, HIGH, or AUTO).
-
         """
         if mode == GainMode.LOW:
             self._send_command(COMMANDS["gain_low"])
+            self._read_status()  # ACK after write
         elif mode == GainMode.HIGH:
             self._send_command(COMMANDS["gain_high"])
-        # AUTO mode requires firmware support
+            self._read_status()  # ACK after write
+        # AUTO mode requires firmware support (not implemented in protocol)
         self.gain_mode = mode
 
     # Private methods
@@ -561,24 +791,44 @@ class P3Camera:
         return bytes(self.dev.ctrl_transfer(0xC1, 0x21, 0, 0, length, 1000))
 
     def _read_status(self) -> int:
-        """Read status byte from the device."""
+        """Read status byte from the device.
+
+        Status values:
+        - 0x02: After write command
+        - 0x03: After read command
+        """
         if self.dev is None:
             raise RuntimeError("Not connected")
         return self.dev.ctrl_transfer(0xC1, 0x22, 0, 0, 1, 1000)[0]
 
-    def _read_raw_frame(self) -> bytes:
-        """Read raw frame data from bulk endpoint."""
+    def read_debug_log(self, length: int = 128) -> str:
+        """Read debug/log messages from the extended status register.
+
+        The camera exposes debug messages when reading more than 1 byte
+        from the status register. Messages appear starting around byte 64.
+
+        Example messages:
+        - "[162] I/default.conf: default configuration already load"
+        - "[34064] I/std cmd: in : 1 1 81"
+        - "[91403] I/shutter: === Shutter close ==="
+
+        Args:
+            length: Number of bytes to read (default 128).
+
+        Returns:
+            Debug message string (may be empty or contain partial messages).
+        """
         if self.dev is None:
-            return b""
-        data = b""
-        target = HEADER_SIZE + self.config.frame_w * self.config.frame_h * 2
-        while len(data) < target:
-            try:
-                chunk = self.dev.read(0x81, 16384, 1000)
-                data += bytes(chunk)
-            except Exception:
-                break
-        return data
+            raise RuntimeError("Not connected")
+        data = bytes(self.dev.ctrl_transfer(0xC1, 0x22, 0, 0, length, 1000))
+        # Debug messages typically start around byte 64
+        msg_data = data[64:] if len(data) > 64 else data
+        # Extract printable ASCII, filtering control characters
+        result = []
+        for b in msg_data:
+            if 32 <= b <= 126 or b in (10, 13):  # Printable or newline
+                result.append(chr(b))
+        return "".join(result).strip()
 
     def _detach_kernel_drivers(self) -> None:
         """Detach kernel drivers from USB interfaces."""

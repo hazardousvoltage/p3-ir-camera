@@ -5,27 +5,35 @@ from __future__ import annotations
 import sys
 
 import numpy as np
-import pytest
+import pytest  # type: ignore[import-untyped]
 
+from p3_camera import CNT3_INCREMENT
+from p3_camera import CNT3_WRAP
 from p3_camera import COMMANDS
-from p3_camera import FRAME_H
-from p3_camera import FRAME_W
-from p3_camera import HEADER_SIZE
 from p3_camera import KELVIN_OFFSET
-from p3_camera import Model
+from p3_camera import MARKER_DTYPE
+from p3_camera import MARKER_SIZE
+from p3_camera import SYNC_END_EVEN
+from p3_camera import SYNC_END_ODD
+from p3_camera import SYNC_START_EVEN
+from p3_camera import SYNC_START_ODD
 from p3_camera import TEMP_SCALE
-from p3_camera import THERMAL_ROW_END
-from p3_camera import THERMAL_ROW_START
-from p3_camera import THERMAL_ROWS
 from p3_camera import EnvParams
+from p3_camera import FrameIncompleteError
+from p3_camera import FrameMarkerMismatchError
+from p3_camera import FrameStats
 from p3_camera import GainMode
+from p3_camera import Model
 from p3_camera import build_command
 from p3_camera import celsius_to_kelvin
 from p3_camera import celsius_to_raw
 from p3_camera import crc16_ccitt
+from p3_camera import extract_both
+from p3_camera import extract_ir_brightness
 from p3_camera import extract_thermal_data
 from p3_camera import get_model_config
 from p3_camera import kelvin_to_celsius
+from p3_camera import parse_marker
 from p3_camera import raw_to_celsius
 from p3_camera import raw_to_kelvin
 
@@ -39,41 +47,58 @@ class TestConstants:
     def test_kelvin_offset(self):
         assert KELVIN_OFFSET == 273.15
 
-    def test_frame_dimensions(self):
-        # Default is P3
-        assert FRAME_W == 256
-        assert FRAME_H == 384
-        assert THERMAL_ROWS == 190
+    def test_marker_size(self):
+        assert MARKER_SIZE == 12
 
-    def test_thermal_rows(self):
-        # Default is P3
-        assert THERMAL_ROW_START == 194
-        assert THERMAL_ROW_END == 384
-        assert THERMAL_ROW_END - THERMAL_ROW_START == THERMAL_ROWS
+    def test_marker_dtype_size(self):
+        assert MARKER_DTYPE.itemsize == 12
+
+    def test_marker_sync_constants(self):
+        """Test marker sync byte constants."""
+        assert SYNC_START_EVEN == 0x8C
+        assert SYNC_START_ODD == 0x8D
+        assert SYNC_END_EVEN == 0x8E
+        assert SYNC_END_ODD == 0x8F
+
+    def test_cnt3_constants(self):
+        """Test cnt3 frame counter constants."""
+        assert CNT3_INCREMENT == 40
+        assert CNT3_WRAP == 2048
 
     def test_p1_model_config(self):
         """Test P1 model configuration."""
         config = get_model_config(Model.P1)
         assert config.model == Model.P1
         assert config.pid == 0x45C2
-        assert config.frame_w == 160
-        assert config.frame_h == 240
+        assert config.sensor_w == 160
+        assert config.sensor_h == 120
+        # Derived properties
+        assert config.frame_rows == 242  # 120 + 2 + 120
+        assert config.frame_size == 2 * 242 * 160  # 77,440 bytes
         assert config.ir_row_end == 120
         assert config.thermal_row_start == 122
-        assert config.thermal_row_end == 240
-        assert config.thermal_rows == 118
+        assert config.thermal_row_end == 242
 
     def test_p3_model_config(self):
         """Test P3 model configuration."""
         config = get_model_config(Model.P3)
         assert config.model == Model.P3
         assert config.pid == 0x45A2
-        assert config.frame_w == 256
-        assert config.frame_h == 384
+        assert config.sensor_w == 256
+        assert config.sensor_h == 192
+        # Derived properties
+        assert config.frame_rows == 386  # 192 + 2 + 192
+        assert config.frame_size == 2 * 386 * 256  # 197,632 bytes
         assert config.ir_row_end == 192
         assert config.thermal_row_start == 194
-        assert config.thermal_row_end == 384
-        assert config.thermal_rows == 190
+        assert config.thermal_row_end == 386
+
+    def test_model_config_from_string(self):
+        """Test model config can be created from string."""
+        config = get_model_config("p3")
+        assert config.model == Model.P3
+        config = get_model_config("P1")
+        assert config.model == Model.P1
 
 
 class TestTemperatureConversion:
@@ -142,37 +167,105 @@ class TestTemperatureConversion:
 class TestFrameParsing:
     """Tests for frame parsing functions."""
 
-    def test_extract_thermal_data_valid(self):
-        # Create synthetic frame data (using P3 default)
-        frame_size = HEADER_SIZE + FRAME_W * FRAME_H * 2
+    def test_parse_marker(self):
+        """Test marker parsing."""
+        # Create a synthetic marker
+        marker_bytes = bytes(
+            [
+                0x0C,  # length = 12
+                0x8C,  # sync byte (start, even frame)
+                0x01,
+                0x00,
+                0x00,
+                0x00,  # cnt1 = 1
+                0x02,
+                0x00,
+                0x00,
+                0x00,  # cnt2 = 2
+                0x28,
+                0x00,  # cnt3 = 40
+            ]
+        )
+        marker = parse_marker(marker_bytes)
+        assert marker["length"][0] == 12
+        assert marker["sync"][0] == SYNC_START_EVEN
+        assert marker["cnt1"][0] == 1
+        assert marker["cnt2"][0] == 2
+        assert marker["cnt3"][0] == 40
+
+    def test_parse_marker_sync_values(self):
+        """Test all marker sync byte values."""
+        # Start marker, even frame
+        marker = parse_marker(bytes([0x0C, SYNC_START_EVEN] + [0] * 10))
+        assert marker["sync"][0] == SYNC_START_EVEN
+
+        # Start marker, odd frame
+        marker = parse_marker(bytes([0x0C, SYNC_START_ODD] + [0] * 10))
+        assert marker["sync"][0] == SYNC_START_ODD
+
+        # End marker, even frame
+        marker = parse_marker(bytes([0x0C, SYNC_END_EVEN] + [0] * 10))
+        assert marker["sync"][0] == SYNC_END_EVEN
+
+        # End marker, odd frame
+        marker = parse_marker(bytes([0x0C, SYNC_END_ODD] + [0] * 10))
+        assert marker["sync"][0] == SYNC_END_ODD
+
+    def test_parse_marker_cnt3_wrap(self):
+        """Test cnt3 wraps at 2048."""
+        # cnt3 at maximum value before wrap
+        marker_bytes = bytes(
+            [
+                0x0C,
+                0x8C,
+                0x00,
+                0x00,
+                0x00,
+                0x00,  # cnt1
+                0x00,
+                0x00,
+                0x00,
+                0x00,  # cnt2
+                0x00,
+                0x08,  # cnt3 = 2048 (at wrap point)
+            ]
+        )
+        marker = parse_marker(marker_bytes)
+        assert marker["cnt3"][0] == CNT3_WRAP
+
+    def test_extract_thermal_data_valid_p3(self):
+        """Test thermal data extraction for P3 model."""
+        config = get_model_config(Model.P3)
+        # Frame data includes marker + pixel data
+        frame_size = MARKER_SIZE + config.frame_size
         data = bytearray(frame_size)
 
         # Fill thermal region with recognizable pattern
-        pixels = np.zeros((FRAME_H, FRAME_W), dtype=np.uint16)
-        pixels[THERMAL_ROW_START:THERMAL_ROW_END, :] = 20000  # Thermal data
-
-        # Pack into bytes
-        data[HEADER_SIZE:] = pixels.tobytes()
-        result = extract_thermal_data(bytes(data), apply_col_offset=False)
-
-        assert result is not None
-        assert result.shape == (THERMAL_ROWS, FRAME_W)
-        assert result[0, 0] == 20000
-
-    def test_extract_thermal_data_p1(self):
-        """Test thermal data extraction for P1 model."""
-        config = get_model_config(Model.P1)
-        frame_size = HEADER_SIZE + config.frame_w * config.frame_h * 2
-        data = bytearray(frame_size)
-
-        pixels = np.zeros((config.frame_h, config.frame_w), dtype=np.uint16)
+        pixels = np.zeros((config.frame_rows, config.sensor_w), dtype=np.uint16)
         pixels[config.thermal_row_start : config.thermal_row_end, :] = 20000
 
-        data[HEADER_SIZE:] = pixels.tobytes()
-        result = extract_thermal_data(bytes(data), apply_col_offset=False, config=config)
+        # Pack into bytes (after marker)
+        data[MARKER_SIZE:] = pixels.tobytes()
+        result = extract_thermal_data(bytes(data), config=config)
 
         assert result is not None
-        assert result.shape == (config.thermal_rows, config.frame_w)
+        assert result.shape == (config.sensor_h, config.sensor_w)  # 192x256
+        assert result[0, 0] == 20000
+
+    def test_extract_thermal_data_valid_p1(self):
+        """Test thermal data extraction for P1 model."""
+        config = get_model_config(Model.P1)
+        frame_size = MARKER_SIZE + config.frame_size
+        data = bytearray(frame_size)
+
+        pixels = np.zeros((config.frame_rows, config.sensor_w), dtype=np.uint16)
+        pixels[config.thermal_row_start : config.thermal_row_end, :] = 20000
+
+        data[MARKER_SIZE:] = pixels.tobytes()
+        result = extract_thermal_data(bytes(data), config=config)
+
+        assert result is not None
+        assert result.shape == (config.sensor_h, config.sensor_w)  # 120x160
         assert result[0, 0] == 20000
 
     def test_extract_thermal_data_too_short(self):
@@ -180,28 +273,45 @@ class TestFrameParsing:
         result = extract_thermal_data(data)
         assert result is None
 
-    def test_extract_thermal_data_col_offset(self):
-        # Test with P3 (default)
-        frame_size = HEADER_SIZE + FRAME_W * FRAME_H * 2
+    def test_extract_ir_brightness_valid(self):
+        """Test IR brightness extraction."""
+        config = get_model_config(Model.P3)
+        frame_size = MARKER_SIZE + config.frame_size
         data = bytearray(frame_size)
 
-        # Create pattern with marker at specific column (use middle row to avoid
-        # edge effects from _fix_alignment_quirk's row shift on edge columns)
-        pixels = np.zeros((FRAME_H, FRAME_W), dtype=np.uint16)
-        pixels[THERMAL_ROW_START + 50, 0] = 12345  # Marker at row 50, col 0
+        # Fill IR region with pattern (low byte = brightness)
+        pixels = np.zeros((config.frame_rows, config.sensor_w), dtype=np.uint16)
+        pixels[: config.ir_row_end, :] = 0x80FF  # Low byte = 0xFF (255)
 
-        data[HEADER_SIZE:] = pixels.tobytes()
+        data[MARKER_SIZE:] = pixels.tobytes()
+        result = extract_ir_brightness(bytes(data), config=config)
 
-        # Without offset
-        result_no_offset = extract_thermal_data(bytes(data), apply_col_offset=False)
-        assert result_no_offset is not None
-        assert result_no_offset[50, 0] == 12345
+        assert result is not None
+        assert result.shape == (config.sensor_h, config.sensor_w)
+        assert result.dtype == np.uint8
+        assert result[0, 0] == 0xFF
 
-        # With offset (marker should move due to _fix_alignment_quirk)
-        result_with_offset = extract_thermal_data(bytes(data), apply_col_offset=True)
-        assert result_with_offset is not None
-        # Quirk: roll -12 cols (0->244), then roll edge cols up by -1 (50->49)
-        assert result_with_offset[49, 244] == 12345
+    def test_extract_both(self):
+        """Test extracting both IR and thermal data."""
+        config = get_model_config(Model.P3)
+        frame_size = MARKER_SIZE + config.frame_size
+        data = bytearray(frame_size)
+
+        pixels = np.zeros((config.frame_rows, config.sensor_w), dtype=np.uint16)
+        # IR brightness (low byte)
+        pixels[: config.ir_row_end, :] = 0x0080  # Low byte = 0x80 (128)
+        # Thermal data
+        pixels[config.thermal_row_start : config.thermal_row_end, :] = 19000
+
+        data[MARKER_SIZE:] = pixels.tobytes()
+        ir, thermal = extract_both(bytes(data), config=config)
+
+        assert ir is not None
+        assert thermal is not None
+        assert ir.shape == (config.sensor_h, config.sensor_w)
+        assert thermal.shape == (config.sensor_h, config.sensor_w)
+        assert ir[0, 0] == 0x80
+        assert thermal[0, 0] == 19000
 
 
 class TestProtocol:
@@ -250,6 +360,42 @@ class TestDataClasses:
         assert env.ambient_temp == 25.0
         assert env.distance == 1.0
         assert env.humidity == 0.5
+
+    def test_frame_stats_defaults(self):
+        """Test FrameStats dataclass defaults."""
+        stats = FrameStats()
+        assert stats.frames_read == 0
+        assert stats.frames_dropped == 0
+        assert stats.marker_mismatches == 0
+        assert stats.last_cnt1 == 0
+        assert stats.last_cnt3 == 0
+
+    def test_frame_stats_mutable(self):
+        """Test FrameStats is mutable for tracking."""
+        stats = FrameStats()
+        stats.frames_read = 10
+        stats.frames_dropped = 2
+        stats.marker_mismatches = 1
+        stats.last_cnt1 = 12345
+        stats.last_cnt3 = 80
+        assert stats.frames_read == 10
+        assert stats.frames_dropped == 2
+        assert stats.marker_mismatches == 1
+        assert stats.last_cnt1 == 12345
+        assert stats.last_cnt3 == 80
+
+
+class TestExceptions:
+    """Tests for custom exceptions."""
+
+    def test_frame_incomplete_error(self):
+        with pytest.raises(FrameIncompleteError):
+            raise FrameIncompleteError("Test error")
+
+    def test_frame_marker_mismatch_error(self):
+        """Test FrameMarkerMismatchError exception."""
+        with pytest.raises(FrameMarkerMismatchError):
+            raise FrameMarkerMismatchError("cnt1 mismatch: start=1, end=2")
 
 
 def _run_tests(test_file: str) -> None:

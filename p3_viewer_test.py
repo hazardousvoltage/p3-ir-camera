@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 
 import numpy as np
-import pytest
+import pytest  # type: ignore[import-untyped]
 
 from p3_viewer import COLORMAPS
 from p3_viewer import ColormapID
