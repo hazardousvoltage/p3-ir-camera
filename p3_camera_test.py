@@ -24,6 +24,7 @@ from p3_camera import FrameMarkerMismatchError
 from p3_camera import FrameStats
 from p3_camera import GainMode
 from p3_camera import Model
+from p3_camera import apply_emissivity_correction
 from p3_camera import build_command
 from p3_camera import celsius_to_kelvin
 from p3_camera import celsius_to_raw
@@ -35,6 +36,7 @@ from p3_camera import get_model_config
 from p3_camera import kelvin_to_celsius
 from p3_camera import parse_marker
 from p3_camera import raw_to_celsius
+from p3_camera import raw_to_celsius_corrected
 from p3_camera import raw_to_kelvin
 
 
@@ -162,6 +164,60 @@ class TestTemperatureConversion:
         assert celsius_to_kelvin(0.0) == pytest.approx(273.15)
         assert celsius_to_kelvin(100.0) == pytest.approx(373.15)
         assert celsius_to_kelvin(-273.15) == pytest.approx(0.0)
+
+
+class TestEmissivityCorrection:
+    """Tests for emissivity correction functions."""
+
+    def test_emissivity_1_no_correction(self):
+        """Perfect blackbody (e=1.0) should return unchanged temperature."""
+        temp_k = 300.0  # 26.85°C
+        result = apply_emissivity_correction(temp_k, emissivity=1.0)
+        assert result == pytest.approx(temp_k)
+
+    def test_emissivity_correction_higher_than_reflected(self):
+        """When apparent > reflected, lower emissivity gives higher corrected temp."""
+        # Object at 50°C (323.15K), reflected at 25°C (298.15K)
+        temp_k = 323.15
+        result_95 = apply_emissivity_correction(temp_k, emissivity=0.95, reflected_temp_c=25.0)
+        result_80 = apply_emissivity_correction(temp_k, emissivity=0.80, reflected_temp_c=25.0)
+        # Lower emissivity = object is hotter than it appears
+        assert result_80 > result_95 > temp_k
+
+    def test_emissivity_correction_array(self):
+        """Test emissivity correction works with arrays."""
+        # All temps above reflected (25°C = 298.15K)
+        temps_k = np.array([310.0, 320.0, 330.0], dtype=np.float32)
+        result = apply_emissivity_correction(temps_k, emissivity=0.95, reflected_temp_c=25.0)
+        assert isinstance(result, np.ndarray)
+        assert result.shape == (3,)
+        assert result.dtype == np.float32
+
+    def test_emissivity_correction_equal_to_reflected(self):
+        """When apparent = reflected, correction has no effect."""
+        reflected_c = 25.0
+        temp_k = reflected_c + 273.15  # Same as reflected
+        result = apply_emissivity_correction(temp_k, emissivity=0.95, reflected_temp_c=reflected_c)
+        assert result == pytest.approx(temp_k, rel=1e-3)
+
+    def test_raw_to_celsius_corrected_with_env(self):
+        """Test end-to-end corrected temperature conversion."""
+        # 25°C = 298.15K, raw = 298.15 * 64 = 19081.6
+        raw = int(298.15 * TEMP_SCALE)
+        env = EnvParams(emissivity=1.0)  # No correction
+        result = raw_to_celsius_corrected(raw, env)
+        assert result == pytest.approx(25.0, abs=0.1)
+
+    def test_raw_to_celsius_corrected_hot_object(self):
+        """Test correction on object hotter than ambient."""
+        # 50°C object, reflected at 25°C
+        raw = int((50.0 + 273.15) * TEMP_SCALE)
+        env_100 = EnvParams(emissivity=1.0, reflected_temp=25.0)
+        env_95 = EnvParams(emissivity=0.95, reflected_temp=25.0)
+        result_100 = raw_to_celsius_corrected(raw, env_100)
+        result_95 = raw_to_celsius_corrected(raw, env_95)
+        # Lower emissivity = higher corrected temperature
+        assert result_95 > result_100
 
 
 class TestFrameParsing:

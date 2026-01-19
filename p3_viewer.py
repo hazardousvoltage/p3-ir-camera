@@ -31,6 +31,7 @@ from p3_camera import Model
 from p3_camera import P3Camera
 from p3_camera import get_model_config
 from p3_camera import raw_to_celsius
+from p3_camera import raw_to_celsius_corrected
 
 
 # =============================================================================
@@ -423,10 +424,11 @@ class P3Viewer:
         h, w = img.shape[:2]
         cy, cx = self._get_spot_coords(thermal)
 
-        # Temperature values
-        spot = raw_to_celsius(thermal[cy, cx])
-        tmin = raw_to_celsius(thermal.min())
-        tmax = raw_to_celsius(thermal.max())
+        # Temperature values (with emissivity correction)
+        env = self.camera.env_params
+        spot = float(raw_to_celsius_corrected(thermal[cy, cx], env))
+        tmin = float(raw_to_celsius_corrected(thermal.min(), env))
+        tmax = float(raw_to_celsius_corrected(thermal.max(), env))
 
         # Top status line
         cv2.putText(
@@ -571,11 +573,14 @@ class P3Viewer:
         """Dump raw thermal data to file."""
         ts = time.strftime("%H%M%S")
         cy, cx = self._get_spot_coords(thermal)
+        env = self.camera.env_params
+        raw_temp = raw_to_celsius(thermal[cy, cx])
+        corrected_temp = raw_to_celsius_corrected(thermal[cy, cx], env)
         print(f"\n--- Dump {ts} ---")
         print(f"Shape: {thermal.shape}, Range: {thermal.min()}-{thermal.max()}")
-        print(
-            f"Center raw: {thermal[cy, cx]}, Center C: {raw_to_celsius(thermal[cy, cx]):.1f}"
-        )
+        print(f"Center raw: {thermal[cy, cx]}")
+        print(f"Center temp (uncorrected): {raw_temp:.1f}C")
+        print(f"Center temp (e={env.emissivity:.2f}): {corrected_temp:.1f}C")
         np.save(f"p3_raw_{ts}.npy", thermal)
         print(f"Saved: p3_raw_{ts}.npy\n")
 

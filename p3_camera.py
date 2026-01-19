@@ -284,6 +284,93 @@ def celsius_to_raw(celsius: float) -> int:
     return int((celsius + KELVIN_OFFSET) * TEMP_SCALE)
 
 
+def apply_emissivity_correction(
+    apparent_temp_k: float | NDArray[np.float32],
+    emissivity: float,
+    reflected_temp_c: float = 25.0,
+) -> float | NDArray[np.float32]:
+    """Apply emissivity correction to apparent temperature.
+
+    Uses the Stefan-Boltzmann radiometric correction formula:
+    T_object = ((T_apparent^4 - (1-ε) * T_reflected^4) / ε)^0.25
+
+    This accounts for the fact that real objects are not perfect blackbodies
+    and reflect some ambient radiation.
+
+    Args:
+        apparent_temp_k: Apparent temperature in Kelvin (what camera measures).
+        emissivity: Object emissivity (0.0-1.0, where 1.0 = perfect blackbody).
+        reflected_temp_c: Reflected/ambient temperature in Celsius (default 25°C).
+
+    Returns:
+        Corrected object temperature in Kelvin.
+
+    Note:
+        Common emissivity values:
+        - Human skin: 0.98
+        - Matte black paint: 0.97
+        - Oxidized steel: 0.79
+        - Polished aluminum: 0.05
+        - Water: 0.96
+
+    Warning:
+        This correction becomes less accurate when:
+        - Emissivity < 0.6 (highly reflective surfaces)
+        - Reflected temperature differs greatly from object temperature
+        For emissivity < 0.5, accurate temperature measurement is unlikely.
+
+    See Also:
+        https://en.wikipedia.org/wiki/Emissivity
+        https://en.wikipedia.org/wiki/Stefan-Boltzmann_law
+        https://flir.custhelp.com/app/answers/detail/a_id/3321/~/flir-cameras---temperature-measurement-formula
+        https://www.reliableplant.com/Read/14134/emissivity-underst-difference-between-apparent,-actual-ir-temps
+
+    """
+    if emissivity >= 1.0:
+        return apparent_temp_k  # Perfect blackbody, no correction needed
+    if emissivity <= 0.0:
+        return apparent_temp_k  # Invalid, return unchanged
+
+    reflected_temp_k = np.float32(reflected_temp_c + KELVIN_OFFSET)
+
+    # Stefan-Boltzmann radiometric correction
+    # T_object^4 = (T_apparent^4 - (1-ε) * T_reflected^4) / ε
+    t_apparent_4 = np.float32(apparent_temp_k) ** 4
+    t_reflected_4 = reflected_temp_k**4
+    t_object_4 = (t_apparent_4 - (1.0 - emissivity) * t_reflected_4) / emissivity
+
+    # Handle edge case where correction yields negative value
+    if isinstance(t_object_4, np.ndarray):
+        t_object_4 = np.maximum(t_object_4, np.float32(0.0))
+        return (t_object_4**0.25).astype(np.float32)
+    else:
+        t_object_4 = max(float(t_object_4), 0.0)
+        return float(t_object_4**0.25)
+
+
+def raw_to_celsius_corrected(
+    raw: float | NDArray[np.uint16],
+    env: EnvParams,
+) -> float | NDArray[np.float32]:
+    """Convert raw sensor value to Celsius with emissivity correction.
+
+    Args:
+        raw: Raw 16-bit sensor value(s).
+        env: Environmental parameters (emissivity, reflected_temp, etc.).
+
+    Returns:
+        Corrected temperature in Celsius.
+
+    """
+    apparent_k = raw_to_kelvin(raw)
+    corrected_k = apply_emissivity_correction(
+        apparent_k,
+        emissivity=env.emissivity,
+        reflected_temp_c=env.reflected_temp,
+    )
+    return kelvin_to_celsius(corrected_k)
+
+
 # =============================================================================
 # Frame Parsing (Pure Functions)
 # =============================================================================
