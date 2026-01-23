@@ -20,7 +20,6 @@ from p3_camera import (
     SYNC_START_ODD,
     TEMP_SCALE,
     EnvParams,
-    FrameIncompleteError,
     FrameMarkerMismatchError,
     FrameStats,
     GainMode,
@@ -455,10 +454,6 @@ class TestDataClasses:
 
 class TestExceptions:
     """Tests for custom exceptions."""
-
-    def test_frame_incomplete_error(self):
-        with pytest.raises(FrameIncompleteError):
-            raise FrameIncompleteError("Test error")
 
     def test_frame_marker_mismatch_error(self):
         """Test FrameMarkerMismatchError exception."""

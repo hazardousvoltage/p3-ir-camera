@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import array
 import contextlib
 import dataclasses
+import logging
 import struct
 import time
 
@@ -30,18 +31,15 @@ import usb.util
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
+LOGGER = logging.getLogger(__name__)
+
 # Device constants
 VID = 0x3474
 MARKER_SIZE = 12
 # Temperature conversion constants
 TEMP_SCALE = 64  # Raw values are in 1/64 Kelvin units
 KELVIN_OFFSET = 273.15
-
-
-class FrameIncompleteError(Exception):
-    """Raised when a frame read returns fewer bytes than expected."""
-
-    pass
+FRAME_READ_CHUNK = 16384
 
 
 class FrameMarkerMismatchError(Exception):
@@ -97,6 +95,11 @@ class ModelConfig:
     def frame_size(self) -> int:
         """Frame data size in bytes (excluding markers)."""
         return 2 * self.frame_rows * self.sensor_w
+
+    @property
+    def frame_read_size(self) -> int:
+        """Full frame data read size from USB in bytes (including markers)."""
+        return self.frame_size + 2 * MARKER_SIZE
 
     @property
     def ir_row_end(self) -> int:
@@ -392,7 +395,7 @@ def raw_to_celsius_corrected(
 # =============================================================================
 
 
-def parse_marker(data: bytes) -> np.ndarray:
+def parse_marker(data: bytes | array.array[int] | memoryview) -> np.ndarray:
     """Parse a 12-byte frame marker.
 
     Args:
@@ -589,10 +592,14 @@ class P3Camera:
     config: ModelConfig = dataclasses.field(default_factory=lambda: _DEFAULT_CONFIG)
     stats: FrameStats = dataclasses.field(default_factory=FrameStats)
     validate_markers: bool = True  # Enable marker validation (cnt1 matching)
-    _frame_buf: Any = dataclasses.field(
+    _frame_buf: array.array[int] | None = dataclasses.field(
         default=None,
         repr=False,
     )  # array.array for frame reads
+    _chunk_buf: array.array[int] | None = dataclasses.field(
+        default=None,
+        repr=False,
+    )  # array.array for chunk reads - array slicing creates a copy :(
 
     def connect(self) -> None:
         """Connect to the camera."""
@@ -605,8 +612,10 @@ class P3Camera:
             )
         self._detach_kernel_drivers()
         self._claim_interfaces()
+
         # Pre-allocate frame buffer for efficient reads
-        self._frame_buf = array.array("B", [0]) * self.config.frame_size
+        self._frame_buf = array.array("B", b"\x00" * self.config.frame_read_size)
+        self._chunk_buf = array.array("B", b"\x00" * FRAME_READ_CHUNK)
 
     def disconnect(self) -> None:
         """Disconnect from the camera."""
@@ -759,14 +768,21 @@ class P3Camera:
     def read_frame(self) -> bytes:
         """Read a complete frame from the camera.
 
-        Frames are transmitted as 3 USB bulk transfers:
+        As per https://github.com/jvdillon/p3-ir-camera/issues/2 and P3_PROTOCOL.md,
+        official app transmits frames as 3 USB bulk transfers:
         1. Main frame data (frame_size bytes): start marker (12) + pixel data (frame_size - 12)
         2. Remaining pixel data (12 bytes)
         3. End marker (12 bytes)
 
-        The first transfer includes the 12-byte start marker at the beginning,
-        so it contains frame_size - 12 bytes of actual pixel data. The second
-        transfer provides the remaining 12 bytes of pixel data.
+        However, this only works reliably on Linux:
+        - On Windows, we get "device is not working" error that is
+          not recoverable until the USB device is closed.
+        - On Mac, we get "overflow" exceptions often
+
+        So instead, we do 16KiB bulk reads until we read frame_size + 12 + 12 bytes.
+        While this does not match the official app, it works reliably on all platforms.
+
+        The first transfer includes the 12-byte start marker at the beginning.
 
         Frame markers are validated:
         - cnt1 must match between start and end markers (same frame)
@@ -776,30 +792,46 @@ class P3Camera:
             Complete frame: start marker (12) + pixel data (frame_size).
 
         Raises:
-            FrameIncompleteError: If fewer bytes than expected were read.
             FrameMarkerMismatchError: If cnt1 doesn't match (when validate_markers=True).
         """
         if self.dev is None or not self.streaming:
             return b""
 
-        frame_size = self.config.frame_size
+        assert self._frame_buf is not None
+        assert self._chunk_buf is not None
 
-        # Read main frame data into pre-allocated buffer
-        # This includes: start marker (12) + partial pixel data (frame_size - 12)
-        # Using array.array allows us to detect short reads
-        n = self.dev.read(0x81, self._frame_buf, 10000)
-        if n != frame_size:
-            raise FrameIncompleteError(f"Read {n} bytes, expected {frame_size}")
+        frame_read_size = self.config.frame_read_size
+        chunk_buf = self._chunk_buf
 
-        # Read remaining 12 bytes of pixel data (transferred separately)
-        remaining = bytes(self.dev.read(0x81, MARKER_SIZE, 1000))
+        # Use memoryviews to prevent copies
+        frame_buf_view = memoryview(self._frame_buf)
+        chunk_buf_view = memoryview(chunk_buf)
 
-        # Read end marker for validation
-        end_marker_bytes = bytes(self.dev.read(0x81, MARKER_SIZE, 1000))
+        # Read frame data into pre-allocated buffer
+        # This includes: start marker (12) + pixel data (frame_size) + end marker (12)
+        pos = 0
+        while pos < frame_read_size:
+            n = self.dev.read(0x81, chunk_buf, 10000)
 
-        # Parse start and end markers
-        start_marker = parse_marker(bytes(self._frame_buf[:MARKER_SIZE]))
-        end_marker = parse_marker(end_marker_bytes)
+            next_pos = pos + n
+
+            # Frame always ends with 12 byte read with the end marker, so if
+            # * got 12 bytes, but not at the end - we found end of frame,
+            #   so reset to 0 and read from start OR,
+            # * got full frame of data, but did not finish with 12b read,
+            #   so reset to 0 and try again to find the end.
+            if (n == MARKER_SIZE and next_pos < frame_read_size) or (
+                next_pos >= frame_read_size and n != MARKER_SIZE
+            ):
+                pos = 0
+                LOGGER.debug("Frame reading out of sync, dropping frame")
+                continue
+
+            frame_buf_view[pos:next_pos] = chunk_buf_view[:n]
+            pos = next_pos
+
+        start_marker = parse_marker(frame_buf_view[:MARKER_SIZE])
+        end_marker = parse_marker(frame_buf_view[-MARKER_SIZE:])
 
         start_cnt1 = int(start_marker["cnt1"][0])
         end_cnt1 = int(end_marker["cnt1"][0])
@@ -833,7 +865,7 @@ class P3Camera:
         self.stats.last_cnt3 = frame_cnt3
 
         # Return complete frame: start marker + all pixel data
-        return bytes(self._frame_buf) + remaining
+        return bytes(frame_buf_view[:-MARKER_SIZE])
 
     def read_frame_both(
         self,
@@ -847,11 +879,8 @@ class P3Camera:
         if self.dev is None or not self.streaming:
             return None, None
 
-        try:
-            raw_data = self.read_frame()
-            return extract_both(raw_data, config=self.config)
-        except FrameIncompleteError:
-            return None, None
+        raw_data = self.read_frame()
+        return extract_both(raw_data, config=self.config)
 
     def trigger_shutter(self) -> None:
         """Trigger shutter/NUC calibration.

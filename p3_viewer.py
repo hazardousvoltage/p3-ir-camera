@@ -20,6 +20,7 @@ from __future__ import annotations
 from enum import IntEnum
 from typing import Any, cast
 
+import logging
 import time
 
 from numpy.typing import NDArray
@@ -630,6 +631,8 @@ def main() -> None:
         help="Camera model (default: p3)",
     )
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG)
 
     try:
         P3Viewer(model=args.model).run()
