@@ -955,7 +955,7 @@ class P3Camera:
 
         start_marker = parse_marker(frame_buf_view[:MARKER_SIZE])
         end_marker = parse_marker(
-            frame_buf_view[shutter_seg_1_end:shutter_seg_1_end + MARKER_SIZE]
+            frame_buf_view[frame_read_size-MARKER_SIZE:frame_read_size]
             )
 
         start_cnt1 = int(start_marker["cnt1"][0])
