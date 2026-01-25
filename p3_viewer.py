@@ -84,9 +84,23 @@ SCALE_INTERP = {
     ScaleMode.LANCZOS: cv2.INTER_LANCZOS4,
 }
 
+class HotspotMode(IntEnum):
+    """Extreme value marker modes."""
+
+    OFF = 0  # Off
+    MAX = 1  # Show maximum
+    MIN = 2  # Show minimum
+    MINMAX = 3  # Show both
+
 
 # Colormaps (BGR format for OpenCV)
 COLORMAPS: dict[ColormapID, NDArray[np.uint8]] = {}
+
+# Color constants
+COLOR_SPOT_MAX =    (0,0,255)
+COLOR_SPOT_MIN =    (255,0,0)
+COLOR_RETICULE =    (0,255,0)
+COLOR_TEXT =        (255,255,255)
 
 
 def _cv_lut(colormap: int) -> NDArray[np.uint8]:
@@ -289,6 +303,7 @@ class P3Viewer:
         self.mirror: bool = False
         self.show_help: bool = False
         self.show_reticule: bool = True
+        self.hotspot_mode: int = HotspotMode.OFF
         self.zoom: int = 3
         self.fps: float = 0.0
         self.enhanced: bool = True
@@ -358,6 +373,74 @@ class P3Viewer:
             cx = tw - 1 - cx
         return cy, cx
 
+    def _coord_to_image(
+        self, 
+        coord: tuple[int, int], 
+        thermal: NDArray[np.uint16], 
+        image: NDArray[np.uint8]
+    ) -> tuple[int, int]:
+        """Transform thermal coordinate to image coordinate."""
+        h, w = image.shape[:2]
+        # unflip image size
+        if self.rotation == 90 or self.rotation == 270: h,w = w,h
+        th, tw = thermal.shape[:2]
+        cy, cx = coord
+
+        # Scale to output image
+        cx_d = int(round((cx / tw) * w))
+        cy_d = int(round((cy / th) * h))
+
+        # Mirror
+        if self.mirror:
+            cx_d = w - cx_d - 1
+
+        # rotation
+        if self.rotation == 90:
+            cy_d, cx_d = cx_d, h-cy_d-1
+        elif self.rotation == 180:
+            cy_d, cx_d = h-cy_d-1, w-cx_d-1
+        elif self.rotation == 270:
+            cy_d, cx_d = w-cx_d-1, cy_d
+
+        return cy_d, cx_d
+
+    def _draw_box_marker(
+        self,
+        coord: tuple[int, int],
+        image: NDArray[np.uint8],
+        annotation: str = "",
+        color: tuple[int, int, int] = (255,255,255),
+        size: int = 25
+    ) -> None:
+        """
+        Draw a square marker onto the image.
+        
+        Args:
+            coord: tuple (y,x) of rectangle center
+            image: image to draw onto
+            annotation: text placed next to the rectangle
+            color: (b,g,r) color for rectangle and text
+            size: size of the rectangle in image space
+        """
+        size = size // 2 + size % 2
+        cy, cx = coord
+        h, w = image.shape[:2]
+        # prevent text from clipping at image border
+        if cy < 20 + size: y_offset = 20 + size
+        else: y_offset = -5 - size
+        x_offset = min(0, w-cx-55)
+        # Draw rectangle and annotation
+        cv2.rectangle(image, (cx-size, cy-size), (cx+size, cy+size), color, 1)
+        cv2.putText(
+            image,
+            annotation,
+            (cx + x_offset, cy + y_offset),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+        )
+
     def _render(self, thermal: NDArray[np.uint16]) -> NDArray[np.uint8]:
         """Render thermal frame to display image."""
 
@@ -426,13 +509,16 @@ class P3Viewer:
     ) -> None:
         """Draw temperature overlays and UI elements."""
         h, w = img.shape[:2]
+        th, tw = thermal.shape
         cy, cx = self._get_spot_coords(thermal)
 
         # Temperature values (with emissivity correction)
         env = self.camera.env_params
         spot = float(raw_to_celsius_corrected(thermal[cy, cx], env))
-        tmin = float(raw_to_celsius_corrected(thermal.min(), env))
-        tmax = float(raw_to_celsius_corrected(thermal.max(), env))
+        cmax = thermal.argmax()
+        cmin = thermal.argmin()
+        tmin = float(raw_to_celsius_corrected(thermal.ravel()[cmin], env))
+        tmax = float(raw_to_celsius_corrected(thermal.ravel()[cmax], env))
 
         # Top status line
         cv2.putText(
@@ -441,7 +527,7 @@ class P3Viewer:
             (10, 20),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
-            (255, 255, 255),
+            COLOR_TEXT,
             1,
         )
 
@@ -452,23 +538,33 @@ class P3Viewer:
         scale = self.scale_mode.name if self.scale_mode != ScaleMode.OFF else ""
         status = f"{self.fps:.1f} FPS | {cmap_name} | {gain_name} | e={emissivity:.2f} {scale}"
         cv2.putText(
-            img, status, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+            img, status, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1
         )
 
         # Crosshair/reticule
         if self.show_reticule:
             cx_d, cy_d = w // 2, h // 2
-            cv2.line(img, (cx_d - 15, cy_d), (cx_d + 15, cy_d), (0, 255, 0), 1)
-            cv2.line(img, (cx_d, cy_d - 15), (cx_d, cy_d + 15), (0, 255, 0), 1)
+            cv2.line(img, (cx_d - 15, cy_d), (cx_d + 15, cy_d), COLOR_RETICULE, 1)
+            cv2.line(img, (cx_d, cy_d - 15), (cx_d, cy_d + 15), COLOR_RETICULE, 1)
             cv2.putText(
                 img,
                 f"{spot:.1f}C",
                 (cx_d + 20, cy_d - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (0, 255, 0),
+                COLOR_RETICULE,
                 2,
             )
+
+        # Maximum spot
+        if self.hotspot_mode in [HotspotMode.MAX, HotspotMode.MINMAX]:
+            cmax_d = self._coord_to_image(divmod(cmax, tw), thermal, img)
+            self._draw_box_marker(cmax_d, img, f"{tmax:.1f}C", color = COLOR_SPOT_MAX)
+
+        # Minimum spot
+        if self.hotspot_mode in [HotspotMode.MIN, HotspotMode.MINMAX]:
+            cmin_d = self._coord_to_image(divmod(cmin, tw), thermal, img)
+            self._draw_box_marker(cmin_d, img, f"{tmin:.1f}C", color = COLOR_SPOT_MIN)
 
         # Help overlay
         if self.show_help:
@@ -482,9 +578,10 @@ class P3Viewer:
             "m-Mirror h-Help  space-Shot",
             "e-Emissivity 1-9 Set ems",
             "x-Scale p-Enhanced d-DDE D-Dump",
+            "t-Toggle reticule b-Cycle min/max marker"
         ]
         overlay = img.copy()
-        cv2.rectangle(overlay, (5, 30), (290, 130), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (5, 30), (290, 150), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
         for i, line in enumerate(lines):
             cv2.putText(
@@ -493,7 +590,7 @@ class P3Viewer:
                 (10, 50 + i * 18),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
-                (255, 255, 255),
+                COLOR_TEXT,
                 1,
             )
 
@@ -509,6 +606,7 @@ class P3Viewer:
 
         if key == ord("r"):
             self.rotation = (self.rotation + 90) % 360
+            print(f"Rotation: {self.rotation} deg")
         elif key == ord("c"):
             self.colormap_idx = (self.colormap_idx + 1) % len(ColormapID)
         elif key == ord("s"):
@@ -525,6 +623,7 @@ class P3Viewer:
             print(f"Gain mode: {new_mode.name}")
         elif key == ord("m"):
             self.mirror = not self.mirror
+            print("Mirror:", "ON" if self.mirror else "OFF")
         elif key == ord("h"):
             self.show_help = not self.show_help
         elif key == ord("e"):
@@ -551,6 +650,9 @@ class P3Viewer:
             print(f"AGC: {self.agc_mode.name}")
         elif key == ord("t"):
             self.show_reticule = not self.show_reticule
+        elif key == ord("b"):
+            self.hotspot_mode = HotspotMode((self.hotspot_mode + 1) % len(HotspotMode))
+            print(f"Hotspot mode: {self.hotspot_mode.name}")
 
         return True
 
