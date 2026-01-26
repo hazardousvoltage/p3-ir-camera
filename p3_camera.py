@@ -85,6 +85,8 @@ class ModelConfig:
     pid: int
     sensor_w: int  # Sensor width (columns)
     sensor_h: int  # Sensor height (rows) - same for IR and thermal
+    shutter_seg_1_lines: int
+    shutter_seg_2_lines: int
 
     @property
     def frame_rows(self) -> int:
@@ -100,6 +102,11 @@ class ModelConfig:
     def frame_read_size(self) -> int:
         """Full frame data read size from USB in bytes (including markers)."""
         return self.frame_size + 2 * MARKER_SIZE
+    
+    @property
+    def frame_buffer_size(self) -> int:
+        """Frame buffer size ."""
+        return self.frame_read_size + self.shutter_seg_1
 
     @property
     def ir_row_end(self) -> int:
@@ -115,6 +122,16 @@ class ModelConfig:
     def thermal_row_end(self) -> int:
         """End row for thermal data (exclusive)."""
         return 2 * self.sensor_h + 2
+    
+    @property
+    def shutter_seg_1(self) -> int:
+        """After manual shutter activation: Start of first frame segment."""
+        return self.shutter_seg_1_lines * self.sensor_w
+    
+    @property
+    def shutter_seg_2(self) -> int:
+        """After manual shutter activation: Start of second frame segment."""
+        return self.shutter_seg_2_lines * self.sensor_w + MARKER_SIZE
 
 
 def get_model_config(model: Model | str = Model.P3) -> ModelConfig:
@@ -133,6 +150,8 @@ def get_model_config(model: Model | str = Model.P3) -> ModelConfig:
             pid=0x45C2,
             sensor_w=160,
             sensor_h=120,  # 120 IR + 2 metadata + 120 thermal = 242 rows
+            shutter_seg_1_lines=36,
+            shutter_seg_2_lines=800
         )
     else:  # P3
         return ModelConfig(
@@ -140,6 +159,8 @@ def get_model_config(model: Model | str = Model.P3) -> ModelConfig:
             pid=0x45A2,
             sensor_w=256,
             sensor_h=192,  # 192 IR + 2 metadata + 192 thermal = 386 rows
+            shutter_seg_1_lines=36,
+            shutter_seg_2_lines=800
         )
 
 
@@ -614,7 +635,7 @@ class P3Camera:
         self._claim_interfaces()
 
         # Pre-allocate frame buffer for efficient reads
-        self._frame_buf = array.array("B", b"\x00" * self.config.frame_read_size)
+        self._frame_buf = array.array("B", b"\x00" * self.config.frame_buffer_size)
         self._chunk_buf = array.array("B", b"\x00" * FRAME_READ_CHUNK)
 
     def disconnect(self) -> None:
@@ -831,7 +852,7 @@ class P3Camera:
             pos = next_pos
 
         start_marker = parse_marker(frame_buf_view[:MARKER_SIZE])
-        end_marker = parse_marker(frame_buf_view[-MARKER_SIZE:])
+        end_marker = parse_marker(frame_buf_view[frame_read_size-MARKER_SIZE:frame_read_size])
 
         start_cnt1 = int(start_marker["cnt1"][0])
         end_cnt1 = int(end_marker["cnt1"][0])
@@ -865,7 +886,7 @@ class P3Camera:
         self.stats.last_cnt3 = frame_cnt3
 
         # Return complete frame: start marker + all pixel data
-        return bytes(frame_buf_view[:-MARKER_SIZE])
+        return bytes(frame_buf_view[:frame_read_size-MARKER_SIZE])
 
     def read_frame_both(
         self,
@@ -882,14 +903,82 @@ class P3Camera:
         raw_data = self.read_frame()
         return extract_both(raw_data, config=self.config)
 
-    def trigger_shutter(self) -> None:
-        """Trigger shutter/NUC calibration.
+    def trigger_shutter(self, return_partial: bool = False) -> None:
+        """Trigger shutter/NUC calibration und read first frame.
 
         The shutter command uses param 0x43 and has no response data.
         The camera automatically triggers shutter approximately every 90 seconds.
+
+        The camera will provide a (potentially mistimed) frame after shutter,
+        including a partial duplicate.
+
+        Args:
+            return_partial: whether to return the incomplete frame as well.
+
+        Returns:
+            Complete frame: start marker (12) + pixel data (frame_size)
+            (Optional) Additional incomplete frame.
         """
         self._send_command(COMMANDS["shutter"])
         self._read_status()  # ACK after write
+
+        assert self._frame_buf is not None
+        assert self._chunk_buf is not None
+
+        shutter_seg_1_start = self.config.shutter_seg_1
+        shutter_seg_1_end = self.config.shutter_seg_2 - MARKER_SIZE
+        shutter_seg_2_start = self.config.shutter_seg_2
+        # larger read size to accomodate for partial frame data
+        frame_read_size = self.config.frame_read_size + shutter_seg_1_start
+        chunk_buf = self._chunk_buf
+
+        # Use memoryviews to prevent copies
+        frame_buf_view = memoryview(self._frame_buf)
+        chunk_buf_view = memoryview(chunk_buf)
+
+        # Read frame data into pre-allocated buffer
+        # This includes:
+        # --- first transfer ---
+        #   start marker (12)
+        # + partial frame pixel data (36 * sensor_w - 12)
+        # + full frame part 1 (764 * sensor_w)
+        # --- second transfer ---
+        # + end marker (12)
+        # + full frame part 2 (8 * sensor_w)
+        pos = 0
+        while pos < frame_read_size:
+            n = self.dev.read(0x81, chunk_buf, 10000)
+
+            next_pos = pos + n
+            frame_buf_view[pos:next_pos] = chunk_buf_view[:n]
+            pos = next_pos
+
+        start_marker = parse_marker(frame_buf_view[:MARKER_SIZE])
+        end_marker = parse_marker(
+            frame_buf_view[frame_read_size-MARKER_SIZE:frame_read_size]
+            )
+
+        start_cnt1 = int(start_marker["cnt1"][0])
+        end_cnt1 = int(end_marker["cnt1"][0])
+        frame_cnt3 = int(end_marker["cnt3"][0])
+
+        # Validate cnt1 matches between start and end markers
+        if start_cnt1 != end_cnt1:
+            self.stats.marker_mismatches += 1
+            if self.validate_markers:
+                raise FrameMarkerMismatchError(
+                    f"cnt1 mismatch: start={start_cnt1}, end={end_cnt1}"
+                )
+
+        # assemble segmented frame data
+        frame_data = bytes(frame_buf_view[:MARKER_SIZE]) \
+            + bytes(frame_buf_view[shutter_seg_1_start:shutter_seg_1_end]) \
+            + bytes(frame_buf_view[shutter_seg_2_start:frame_read_size - MARKER_SIZE])
+
+        if return_partial:
+            return frame_data, bytes(frame_buf_view[MARKER_SIZE:shutter_seg_1_start])
+        else:
+            return frame_data
 
     def set_gain_mode(self, mode: GainMode) -> None:
         """Set sensor gain mode.

@@ -191,13 +191,12 @@ dev.set_interface_altsetting(interface=1, alternate_setting=0)
 
 ## Frame Transfer
 
-Frames are transmitted as **3 separate USB bulk transfers**:
+Frames are transmitted as **2 separate USB bulk transfers**:
 
 | Transfer | Size (P3) | Contents |
 |----------|-----------|----------|
-| 1 | 197,632 | Start marker (12) + pixel data (197,620) |
-| 2 | 12 | Remaining pixel data (12 bytes) |
-| 3 | 12 | End marker |
+| 1 | 197,644 | Start marker (12) + pixel data (197,632) |
+| 2 | 12 | End marker |
 
 ```python
 MARKER_SIZE = 12
@@ -317,6 +316,20 @@ dev.ctrl_transfer(0x41, 0x20, 0, 0, COMMANDS['shutter'])
 The camera automatically triggers shutter approximately every 90 seconds,
 even when streaming is stopped. The camera appears to always be in acquire
 mode unless unplugged or reset.
+
+After manual shutter activation, the first frame is transmitted in a nonstandard fashion.
+There are 3 USB bulk transfers:
+
+| Transfer | Size (P3) | Contents |
+|----------|-----------|----------|
+| 1 | 204,800 | Start marker (12) + partial frame (9,204) + pixel data (195,584) |
+| 2 | 2,060 | Second start (?) marker (12) +  remaining pixel data (2,048) |
+| 3 | 12 | End marker (12) |
+
+The partial frame data is the top 36 lines of the IR image minus the last 6 pixels and repeated
+in the full frame.
+The second start marker has the same sync byte as the first one, but shares counter 3
+with the end marker.
 
 ## Display Pipeline
 
