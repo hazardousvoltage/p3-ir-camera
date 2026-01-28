@@ -26,6 +26,8 @@ dependencies = [
     "numpy>=1.24",
     "opencv-python>=4.8",
     "pyusb>=1.2",
+    "pyserial>=3.0",
+    "matplotlib>=3.5",
 ]
 
 [project.optional-dependencies]

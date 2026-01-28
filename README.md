@@ -1,10 +1,13 @@
 # P3 IR Camera
 
-Python driver and viewer for P3-series USB thermal cameras.
+Python driver and viewer for P3-series USB thermal cameras.  Improved? with lock-in thermography function.  See lock-in.md
 
 ![P3 Viewer](viewer.png)
 
+![ESP32](esp32-lockin.png)
+
 **Devices**:
+
 - P1: VID=0x3474, PID=0x45C2, 160×120 native resolution
 - P3: VID=0x3474, PID=0x45A2, 256×192 native resolution
 
@@ -22,6 +25,7 @@ Python driver and viewer for P3-series USB thermal cameras.
 - Multiple AGC modes (factory hardware AGC, temporal percentile, fixed range)
 - Shutter/NUC calibration control
 - High/Low gain mode switching
+- Rudimentary lock-in thermography for finding very small temperature changes
 
 ## Installation
 
@@ -69,9 +73,13 @@ p3-viewer --model=p1
 
 # Use P3 camera explicitly
 p3-viewer --model=p3
+
+# Lock-in thermography - press 'l' once viewer is open
+p3-viewer --frequency 0.1 --integration 120
 ```
 
 **Controls:**
+
 - `q` - Quit
 - `h` - Toggle help overlay
 - `c` - Cycle colormap
@@ -89,6 +97,7 @@ p3-viewer --model=p3
 - `1-9` - Set emissivity (0.1-0.9)
 - `D` - Dump raw thermal data to file
 - `Space` - Screenshot
+- `l` Activate lock-in thermography
 
 ### Library
 
