@@ -2,7 +2,12 @@
 
 Python driver and viewer for P3-series USB thermal cameras.
 
-![P3 Viewer](viewer.png)
+![P3 Viewer - Keyboard](screenshots/jvdillon-keyboard.png)
+![P3 Viewer - Chip](screenshots/huberbenno.png)
+
+Images courtesy of [jvdillon](https://github.com/jvdillon) and
+[huberbenno](https://github.com/huberbenno)
+([PR#11](https://github.com/jvdillon/p3-ir-camera/pull/11)).
 
 **Devices**:
 - P1: VID=0x3474, PID=0x45C2, 160×120 native resolution
