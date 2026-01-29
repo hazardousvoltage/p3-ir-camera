@@ -89,6 +89,8 @@ p3-viewer --model=p3
 - `1-9` - Set emissivity (0.1-0.9)
 - `D` - Dump raw thermal data to file
 - `Space` - Screenshot
+- `b` - Toggle min/max spot marker
+- `v` - Toggle colorbar
 
 ### Library
 

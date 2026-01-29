@@ -12,7 +12,8 @@ Controls:
   e - Emissivity     1-9 - Set emissivity (0.1-0.9)
   x - Scale mode     p - Enhanced (CLAHE+DDE)
   a - AGC mode       t - Toggle reticule
-  d - Toggle DDE
+  d - Toggle DDE     b - Toggle min/max marker
+  v - Toggle colorbar
 """
 
 from __future__ import annotations
@@ -62,6 +63,14 @@ class ScaleMode(IntEnum):
     BILINEAR = 2  # Bilinear (smooth, fast)
     BICUBIC = 3  # Bicubic (sharper than bilinear)
     LANCZOS = 4  # Lanczos (sharpest, slowest)
+
+class CVLineType(IntEnum):
+    """Draw style for cv2 lines and text."""
+
+    FILLED = cv2.FILLED
+    LINE_4 = cv2.LINE_4
+    LINE_8 = cv2.LINE_8
+    LINE_AA = cv2.LINE_AA
 
 
 class AGCMode(IntEnum):
@@ -303,12 +312,14 @@ class P3Viewer:
         self.mirror: bool = False
         self.show_help: bool = False
         self.show_reticule: bool = True
+        self.show_colorbar: bool = True
         self.hotspot_mode: int = HotspotMode.OFF
         self.zoom: int = 3
         self.fps: float = 0.0
         self.enhanced: bool = True
         self.use_clahe: bool = True
         self.scale_mode: ScaleMode = ScaleMode.BICUBIC
+        self.cv_linetype: CVLineType = CVLineType.LINE_AA
         self.agc_mode: AGCMode = AGCMode.FACTORY
         self.dde_strength: float = 0.3
         self.tnr_alpha: float = 0.5
@@ -430,7 +441,7 @@ class P3Viewer:
         else: y_offset = -5 - size
         x_offset = min(0, w-cx-55)
         # Draw rectangle and annotation
-        cv2.rectangle(image, (cx-size, cy-size), (cx+size, cy+size), color, 1)
+        cv2.rectangle(image, (cx-size, cy-size), (cx+size, cy+size), color, 1, self.cv_linetype)
         cv2.putText(
             image,
             annotation,
@@ -439,10 +450,13 @@ class P3Viewer:
             0.6,
             color,
             2,
+            self.cv_linetype
         )
 
     def _render(self, thermal: NDArray[np.uint16]) -> NDArray[np.uint8]:
         """Render thermal frame to display image."""
+
+        frame_stats = {}
 
         # AGC: normalize to 8-bit based on selected mode
         if self.agc_mode == AGCMode.FACTORY:
@@ -475,6 +489,18 @@ class P3Viewer:
         # DDE: edge enhancement
         img = dde(img, strength=self.dde_strength)
 
+        # Temperature values (with emissivity correction)
+        cy, cx = self._get_spot_coords(thermal)
+        env = self.camera.env_params
+        frame_stats['tspot'] = float(raw_to_celsius_corrected(thermal[cy, cx], env))
+        frame_stats['cmax'] = thermal.argmax()
+        frame_stats['cmin'] = thermal.argmin()
+        frame_stats['tmin'] = float(raw_to_celsius_corrected(thermal.ravel()[frame_stats['cmin']], env))
+        frame_stats['tmax'] = float(raw_to_celsius_corrected(thermal.ravel()[frame_stats['cmax']], env))
+        # value range
+        frame_stats['range_min'] = int(np.min(img))
+        frame_stats['range_max'] = int(np.max(img))
+
         # Apply colormap
         img = apply_colormap(img, self.colormap_idx)
 
@@ -499,36 +525,83 @@ class P3Viewer:
             ),
         )
 
+        if self.show_colorbar:
+            self._draw_colorbar(result, frame_stats)
+
         # Overlays
-        self._draw_overlays(result, thermal)
+        self._draw_overlays(result, thermal, frame_stats)
 
         return result
+    
+    def _draw_colorbar(
+        self, 
+        img: NDArray[np.uint8],
+        frame_stats: dict,
+        height: float =.5, 
+        width: int = 20, 
+        ticks: int = 5, 
+        outline: bool = True
+    ) -> None:
+        """Draw a colorbar for the current colormap on the center right of the image."""
+
+        # at least ticks for min and max
+        ticks = max(2,ticks)
+
+        # resample color map to image resolution
+        h, w = img.shape[:2]
+        h_cbar = int(height * h)
+        val_range = (frame_stats['range_max']-frame_stats['range_min'])
+        ind = (np.arange(0.5, h_cbar) / h_cbar) * val_range
+        ind = (ind + frame_stats['range_min']+ .5).astype(np.uint8)
+        cmap_resamp = get_colormap(self.colormap_idx)[ind[::-1]]
+
+        # draw colorbar
+        y_offset = int(.5 * (1-height) * h)
+        x_offset = 50
+        img[y_offset:y_offset+h_cbar, -x_offset-width:-x_offset] = cmap_resamp.reshape(h_cbar, 1, 3)
+
+        # draw colorbar outline
+        if outline:
+            cv2.rectangle(
+                img, 
+                (w-x_offset-width, y_offset), 
+                (w-x_offset, y_offset+h_cbar), 
+                COLOR_TEXT, 1, self.cv_linetype
+            )
+
+        # draw ticks
+        tick_pos = (np.linspace(0,1, ticks) * h_cbar + y_offset).astype(np.uint16)[::-1]
+        tick_labels = [f'{t:.1f}' for t in np.linspace(frame_stats['tmin'], frame_stats['tmax'], ticks)]
+        for pos, label in zip(tick_pos, tick_labels):
+            cv2.line(img, (w-x_offset-width, pos), (w-x_offset, pos), COLOR_TEXT, 1, self.cv_linetype)
+            cv2.putText(
+                img,
+                label,
+                (w-x_offset+2, pos + 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                COLOR_TEXT,
+                1,
+                self.cv_linetype
+            )
 
     def _draw_overlays(
-        self, img: NDArray[np.uint8], thermal: NDArray[np.uint16]
+        self, img: NDArray[np.uint8], thermal: NDArray[np.uint16], frame_stats: dict
     ) -> None:
         """Draw temperature overlays and UI elements."""
         h, w = img.shape[:2]
         th, tw = thermal.shape
-        cy, cx = self._get_spot_coords(thermal)
-
-        # Temperature values (with emissivity correction)
-        env = self.camera.env_params
-        spot = float(raw_to_celsius_corrected(thermal[cy, cx], env))
-        cmax = thermal.argmax()
-        cmin = thermal.argmin()
-        tmin = float(raw_to_celsius_corrected(thermal.ravel()[cmin], env))
-        tmax = float(raw_to_celsius_corrected(thermal.ravel()[cmax], env))
 
         # Top status line
         cv2.putText(
             img,
-            f"Spot: {spot:.1f}C | Range: {tmin:.1f}-{tmax:.1f}C",
+            f"Spot: {frame_stats['tspot']:.1f}C | Range: {frame_stats['tmin']:.1f}-{frame_stats['tmax']:.1f}C",
             (10, 20),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             COLOR_TEXT,
             1,
+            self.cv_linetype
         )
 
         # Bottom status line
@@ -538,33 +611,41 @@ class P3Viewer:
         scale = self.scale_mode.name if self.scale_mode != ScaleMode.OFF else ""
         status = f"{self.fps:.1f} FPS | {cmap_name} | {gain_name} | e={emissivity:.2f} {scale}"
         cv2.putText(
-            img, status, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1
+            img, 
+            status, 
+            (10, h - 10), 
+            cv2.FONT_HERSHEY_SIMPLEX, 
+            0.5, 
+            COLOR_TEXT, 
+            1,
+            self.cv_linetype
         )
 
         # Crosshair/reticule
         if self.show_reticule:
             cx_d, cy_d = w // 2, h // 2
-            cv2.line(img, (cx_d - 15, cy_d), (cx_d + 15, cy_d), COLOR_RETICULE, 1)
-            cv2.line(img, (cx_d, cy_d - 15), (cx_d, cy_d + 15), COLOR_RETICULE, 1)
+            cv2.line(img, (cx_d - 15, cy_d), (cx_d + 15, cy_d), COLOR_RETICULE, 1, self.cv_linetype)
+            cv2.line(img, (cx_d, cy_d - 15), (cx_d, cy_d + 15), COLOR_RETICULE, 1, self.cv_linetype)
             cv2.putText(
                 img,
-                f"{spot:.1f}C",
+                f"{frame_stats['tspot']:.1f}C",
                 (cx_d + 20, cy_d - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 COLOR_RETICULE,
                 2,
+                self.cv_linetype
             )
 
         # Maximum spot
         if self.hotspot_mode in [HotspotMode.MAX, HotspotMode.MINMAX]:
-            cmax_d = self._coord_to_image(divmod(cmax, tw), thermal, img)
-            self._draw_box_marker(cmax_d, img, f"{tmax:.1f}C", color = COLOR_SPOT_MAX)
+            cmax_d = self._coord_to_image(divmod(frame_stats['cmax'], tw), thermal, img)
+            self._draw_box_marker(cmax_d, img, f"{frame_stats['tmax']:.1f}C", color = COLOR_SPOT_MAX)
 
         # Minimum spot
         if self.hotspot_mode in [HotspotMode.MIN, HotspotMode.MINMAX]:
-            cmin_d = self._coord_to_image(divmod(cmin, tw), thermal, img)
-            self._draw_box_marker(cmin_d, img, f"{tmin:.1f}C", color = COLOR_SPOT_MIN)
+            cmin_d = self._coord_to_image(divmod(frame_stats['cmin'], tw), thermal, img)
+            self._draw_box_marker(cmin_d, img, f"{frame_stats['tmin']:.1f}C", color = COLOR_SPOT_MIN)
 
         # Help overlay
         if self.show_help:
@@ -573,15 +654,17 @@ class P3Viewer:
     def _draw_help(self, img: NDArray[np.uint8]) -> None:
         """Draw help overlay."""
         lines = [
-            "q-Quit  +/- Zoom  r-Rotate",
-            "c-Color s-Shutter g-Gain",
-            "m-Mirror h-Help  space-Shot",
-            "e-Emissivity 1-9 Set ems",
-            "x-Scale p-Enhanced d-DDE D-Dump",
-            "t-Toggle reticule b-Cycle min/max marker"
+            "q-Quit  h-help",
+            "space-Shot  D-Dump",
+            "+/- Zoom  r-Rotate  m-Mirror",
+            "s-Shutter  g-High/Low Gain",
+            "c-Colormap  v-Colorbar",
+            "e-Emissivity  1-9 Set ems",
+            "x-Scale  p-Enhanced  d-DDE",
+            "t-Reticule  b-Min/max marker"
         ]
         overlay = img.copy()
-        cv2.rectangle(overlay, (5, 30), (290, 150), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (5, 30), (260, 185), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
         for i, line in enumerate(lines):
             cv2.putText(
@@ -592,6 +675,7 @@ class P3Viewer:
                 0.4,
                 COLOR_TEXT,
                 1,
+                self.cv_linetype
             )
 
     def _handle_key(self, thermal: NDArray[np.uint16]) -> bool:
@@ -650,6 +734,8 @@ class P3Viewer:
             print(f"AGC: {self.agc_mode.name}")
         elif key == ord("t"):
             self.show_reticule = not self.show_reticule
+        elif key == ord("v"):
+            self.show_colorbar = not self.show_colorbar
         elif key == ord("b"):
             self.hotspot_mode = HotspotMode((self.hotspot_mode + 1) % len(HotspotMode))
             print(f"Hotspot mode: {self.hotspot_mode.name}")
