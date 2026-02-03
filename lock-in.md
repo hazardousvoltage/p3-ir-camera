@@ -26,13 +26,13 @@ Once the viewer is running and sees your thermal image, press 'l' to run the loc
 
 This image is of the ESP32 board which is acting as the lock-in controller.  The added dissipation in the regulator in phase with the output, as well as in the onboard LED and its resistor can be clearly seen.
 
-![esp32-lockin.png](esp32-lockin.png)
+![esp32-lockin.png](screenshots/esp32-lockin.png)
 
 
 
 This one is a 33K resistor connected to the output, being driven with 3.3V from the ESP32.  The power dissipation in this resistor while it's switched on is 330uW, and the resultant heating is clearly visible here.  A second unpowered resistor is next to the target as a control.
 
-![resistor-lockin.png](resistor-lockin.png)
+![resistor-lockin.png](screenshots/resistor-lockin.png)
 
 
 
