@@ -28,6 +28,12 @@ from numpy.typing import NDArray
 
 import cv2
 import numpy as np
+import threading
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+
+from lockin import LockInController
 
 from p3_camera import (
     GainMode,
@@ -181,6 +187,32 @@ def apply_colormap(
     lut = get_colormap(cmap_id)
     return lut[img_u8]
 
+def apply_diverging_colormap(data: np.ndarray, cmap_name: str = 'bwr') -> np.ndarray:
+  
+    data = np.asarray(data, dtype=np.float32)
+    lo = float(np.nanpercentile(data, 0.01))
+    hi = float(np.nanpercentile(data, 99.99))
+    if hi <= lo:
+        hi = lo + 1.0
+    norm_data = 2 * (data - lo) / (hi - lo) - 1.0 # Normalize to [-1, 1]
+    data=np.clip(norm_data, -1.0, 1.0)
+    
+    # Center at 'center' (usually 0) using TwoSlopeNorm or CenteredNorm
+    # Got better results normalizing and clipping above then using TwoSlopeNorm in this
+    # fashion, vs. using it directly as intended.  ???.
+    norm = mcolors.TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+    
+    cmap = cm.get_cmap(cmap_name)
+    
+    # Map to [0,1] then to RGBA [0,255]
+    rgba_float = cmap(norm(data))          # shape (h,w,4), float 0-1
+    rgb_float = rgba_float[..., :3]         # drop alpha → (h, w, 3)
+    rgb_uint8 = (rgb_float * 255).astype(np.uint8)
+
+    # Convert matplotlib RGB (R,G,B) to OpenCV BGR ordering to match apply_colormap
+    bgr_uint8 = rgb_uint8[..., ::-1]
+    return bgr_uint8
+
 
 # =============================================================================
 # Image Processing (ISP)
@@ -298,15 +330,26 @@ def tnr(
 class P3Viewer:
     """P3 Thermal Camera Viewer."""
 
-    def __init__(self, model: Model | str = Model.P3) -> None:
+    def __init__(self, model: Model | str = Model.P3, serial_port: str = "/dev/ttyACM0",
+                 baud_rate: int = 115200, lockin_period: float = 0.72,
+                 lockin_integration: float = 60.0, lockin_invert: bool = False) -> None:
         """Initialize viewer.
 
         Args:
             model: Camera model (P1 or P3).
+            serial_port: Serial port for lock-in load controller.
+            baud_rate: Baud rate for serial port.
+            lockin_period: Lock-in period in seconds.
+            lockin_integration: Integration time in seconds.
         """
         config = get_model_config(model)
         self.camera = P3Camera(config=config)
         self.model = config.model
+        self.serial_port = serial_port
+        self.baud_rate = baud_rate
+        self.lockin_period = lockin_period
+        self.lockin_integration = lockin_integration
+        self.lockin_invert = bool(lockin_invert)
         self.rotation: int = 0
         self.colormap_idx: int = ColormapID.IRONBOW
         self.mirror: bool = False
@@ -329,6 +372,10 @@ class P3Viewer:
         self._last_display: NDArray[np.uint8] | None = None
         self._prev_frame: NDArray[np.uint16] | None = None
         self._ir_brightness: NDArray[np.uint8] | None = None
+        # Lock-in controller (created on demand)
+        self.lockin_controller: LockInController | None = None
+        self.lockin_thread: threading.Thread | None = None
+        self.lockin_running: bool = False
 
     def run(self) -> None:
         """Main viewer loop."""
@@ -342,14 +389,22 @@ class P3Viewer:
 
         window_name = f"{model_name} Thermal"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 640, 480)
+        cv2.resizeWindow(window_name, 1280, 720)
 
         try:
             while True:
+
                 ir_brightness, thermal = self.camera.read_frame_both()
                 if thermal is None:
                     continue
                 self._ir_brightness = ir_brightness
+
+                # Feed frames to lock-in controller so only main thread reads USB.
+                if self.lockin_controller is not None and self.lockin_running:
+                    try:
+                        self.lockin_controller.push_frame(thermal.copy(), time.perf_counter())
+                    except Exception:
+                        pass
 
                 # Apply temporal noise reduction
                 thermal = tnr(thermal, self._prev_frame, alpha=self.tnr_alpha)
@@ -531,6 +586,16 @@ class P3Viewer:
         # Overlays
         self._draw_overlays(result, thermal, frame_stats)
 
+        # If lock-in results exist, composite two panes to the right
+        if self.lockin_controller is not None:
+            in_phase, quad, amplitude, angle = self.lockin_controller.get_latest()
+            if in_phase is not None and quad is not None and amplitude is not None and angle is not None:
+                try:
+                    result = self._composite_lockin_panes(result, in_phase, quad, amplitude, angle)
+                except Exception:
+                    # Don't let lock-in display errors break rendering
+                    pass
+
         return result
     
     def _draw_colorbar(
@@ -584,6 +649,67 @@ class P3Viewer:
                 1,
                 self.cv_linetype
             )
+
+    def _normalize(self, arr: NDArray[np.floating]) -> NDArray[np.float32]:
+        a = np.asarray(arr, dtype=np.float32)
+        # Just a little clip to eliminate ridiculous outliers
+        lo = float(np.percentile(a, 0.01))
+        hi = float(np.percentile(a, 99.99))
+        if hi <= lo:
+            hi = lo + 1.0
+        norm = (a - lo) / (hi - lo)
+        return np.clip(norm, 0, 1.0)
+
+    def _composite_lockin_panes(
+        self, main_img: NDArray[np.uint8], in_phase: NDArray[np.floating], quad: NDArray[np.floating],
+        amplitude: NDArray[np.floating], angle: NDArray[np.floating]
+    ) -> NDArray[np.uint8]:
+        """Compose the main display with a 2x2 grid of lock-in results on the right.
+
+        Grid layout:
+        [In-Phase    | Amplitude]
+        [Quadrature  | Angle    ]
+        """
+        h, w = main_img.shape[:2]
+
+        # Normalize and colorize all four panes
+        # In-Phase
+        ip_color = apply_diverging_colormap(in_phase)
+        
+        # Quadrature
+        q_color = apply_diverging_colormap(quad)
+
+        # Amplitude (magnitude) - use current colormap for consistency
+        amp_norm = self._normalize(amplitude)
+        amp_u8 = (amp_norm * 255.0).astype(np.uint8)
+        amp_color = apply_colormap(amp_u8, self.colormap_idx)
+        
+        # Angle - map [-pi, pi] to color
+        masked_angle = np.where(amplitude >= amplitude.mean(), angle, np.nan)
+        angle_color = apply_diverging_colormap(masked_angle, cmap_name='twilight')
+
+        # Decide pane dimensions
+        pane_w = max(64, w // 3)
+        pane_h = h // 2
+
+        # Resize all four panes to consistent size
+        ip_resized = cv2.resize(ip_color, (pane_w, pane_h), interpolation=cv2.INTER_AREA)
+        q_resized = cv2.resize(q_color, (pane_w, pane_h), interpolation=cv2.INTER_AREA)
+        amp_resized = cv2.resize(amp_color, (pane_w, pane_h), interpolation=cv2.INTER_AREA)
+        angle_resized = cv2.resize(angle_color, (pane_w, pane_h), interpolation=cv2.INTER_AREA)
+
+        # Create 2x2 grid
+        top_row = np.hstack([ip_resized, amp_resized])
+        bottom_row = np.hstack([q_resized, angle_resized])
+        grid = np.vstack([top_row, bottom_row])
+
+        # If main_img has different number of channels, ensure 3
+        if main_img.ndim == 2:
+            main_img = cast(NDArray[np.uint8], cv2.cvtColor(main_img, cv2.COLOR_GRAY2BGR))
+            main_img = np.asarray(main_img, dtype=np.uint8)
+
+        composite = np.hstack([main_img, grid])
+        return np.asarray(composite, dtype=np.uint8)
 
     def _draw_overlays(
         self, img: NDArray[np.uint8], thermal: NDArray[np.uint16], frame_stats: dict
@@ -729,6 +855,33 @@ class P3Viewer:
             print(f"Scale: {self.scale_mode.name}")
         elif key == ord("p"):
             self._toggle_enhanced()
+        elif key == ord("l"):
+            # Toggle lock-in capture
+            if not self.lockin_running:
+                try:
+                    # Create and start the lock-in controller with configured parameters
+                    self.lockin_controller = LockInController(
+                        self.camera, port=self.serial_port, baud_rate=self.baud_rate,
+                        period=self.lockin_period, integration=self.lockin_integration,
+                        invert=self.lockin_invert,
+                    )
+                    self.lockin_thread = self.lockin_controller.start_background()
+                    self.lockin_running = True
+                    print("Lock-in: started")
+                except Exception as e:
+                    print("Lock-in start failed:", e)
+            else:
+                # Stop and save results
+                try:
+                    if self.lockin_controller is not None:
+                        self.lockin_controller.stop(wait=True)
+                        print("Lock-in: stopped")
+                except Exception as e:
+                    print("Lock-in stop failed:", e)
+                finally:
+                    self.lockin_running = False
+                    self.lockin_controller = None
+                    self.lockin_thread = None
         elif key == ord("a"):
             self.agc_mode = AGCMode((self.agc_mode + 1) % len(AGCMode))
             print(f"AGC: {self.agc_mode.name}")
@@ -807,6 +960,16 @@ def main() -> None:
     """Entry point."""
     import argparse
 
+    def _parse_bool(val: str) -> bool:
+        if isinstance(val, bool):
+            return val
+        s = str(val).strip().lower()
+        if s in ("1", "true", "t", "yes", "y"):
+            return True
+        if s in ("0", "false", "f", "no", "n"):
+            return False
+        raise argparse.ArgumentTypeError(f"invalid boolean value: {val}")
+
     parser = argparse.ArgumentParser(
         description="Thermal Master P3/P1 USB thermal camera viewer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -818,12 +981,46 @@ def main() -> None:
         default="p3",
         help="Camera model (default: p3)",
     )
+    parser.add_argument(
+        "--serial-port",
+        type=str,
+        default="/dev/ttyACM0",
+        help="Serial port for lock-in load controller (default: /dev/ttyACM0)",
+    )
+    parser.add_argument(
+        "--baud-rate",
+        type=int,
+        default=115200,
+        help="Baud rate for serial port (default: 115200)",
+    )
+    parser.add_argument(
+        "--period",
+        type=float,
+        default=1.0,
+        help="Lock-in period in seconds (default: 1.0)",
+    )
+    parser.add_argument(
+        "--integration",
+        type=float,
+        default=60.0,
+        help="Lock-in integration time in seconds (default: 60.0)",
+    )
+    parser.add_argument(
+        "--invert",
+        nargs="?",
+        const="1",
+        type=_parse_bool,
+        default=False,
+        help="Invert lock-in serial output logic (accepts 0/1 or false/true).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG)
 
     try:
-        P3Viewer(model=args.model).run()
+           P3Viewer(model=args.model, serial_port=args.serial_port, baud_rate=args.baud_rate,
+               lockin_period=args.period, lockin_integration=args.integration,
+               lockin_invert=args.invert).run()
     except RuntimeError as e:
         print(f"Error: {e}")
     except KeyboardInterrupt:
