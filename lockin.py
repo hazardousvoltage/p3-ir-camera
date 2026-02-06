@@ -282,7 +282,8 @@ class LockInController:
                 self._last_quadrature = quadrature
                 self._last_amplitude = mag
                 self._last_angle = angle
-
+            
+            print(f'Frame: {total_frames}, lock-in integration complete')
             return
 
         finally:
