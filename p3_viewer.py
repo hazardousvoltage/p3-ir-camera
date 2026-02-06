@@ -331,7 +331,7 @@ class P3Viewer:
     """P3 Thermal Camera Viewer."""
 
     def __init__(self, model: Model | str = Model.P3, serial_port: str = "/dev/ttyACM0",
-                 baud_rate: int = 115200, lockin_period: float = 0.72,
+                 baud_rate: int = 115200, lockin_period: float = 1.0,
                  lockin_integration: float = 60.0, lockin_invert: bool = False) -> None:
         """Initialize viewer.
 
